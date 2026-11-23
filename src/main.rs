@@ -1,6 +1,8 @@
 //! Windows 11-style Rust player. Rust owns the window, command bar, stage and transport.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod backend;
+mod chiaki;
+mod chiaki_ui;
 mod design;
 mod migration;
 #[cfg(test)]
@@ -1359,6 +1361,10 @@ struct Startup {
     install_root: PathBuf,
     profile_root: PathBuf,
     import_legacy: bool,
+    ipc: bool,
+    custom_data_root: bool,
+    connect: bool,
+    backend_archive: Option<PathBuf>,
 }
 impl Startup {
     fn from_options(
@@ -1366,8 +1372,35 @@ impl Startup {
         override_root: Option<PathBuf>,
         args: impl IntoIterator<Item = std::ffi::OsString>,
     ) -> std::io::Result<Self> {
-        let import_legacy =
-            override_root.is_none() && args.into_iter().any(|arg| arg == "--import-legacy");
+        let custom_data_root = override_root.is_some();
+        let mut import_legacy = false;
+        let mut ipc = false;
+        let mut connect = false;
+        let mut backend_archive = None;
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            if arg == "--ipc-backend" {
+                ipc = true;
+            } else if arg == "--import-legacy" {
+                // Preserve the explicit v0.1.7 CLI. Its encrypted vault is only meaningful to IPC backends.
+                ipc = true;
+                import_legacy = !custom_data_root;
+            } else if arg == "--connect" {
+                connect = true;
+            } else if arg == "--backend-archive" {
+                let path = args.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "--backend-archive 需要官方 ZIP 文件路径。",
+                    )
+                })?;
+                backend_archive = Some(std::path::absolute(path)?);
+            }
+        }
+        if ipc && (connect || backend_archive.is_some()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                "--connect / --backend-archive 适用于 chiaki-ng，不能与 --ipc-backend / --import-legacy 同用。"));
+        }
         let profile_root = match override_root {
             Some(path) if !path.as_os_str().is_empty() => std::path::absolute(path)?,
             Some(_) => {
@@ -1382,6 +1415,10 @@ impl Startup {
             install_root,
             profile_root,
             import_legacy,
+            ipc,
+            custom_data_root,
+            connect,
+            backend_archive,
         })
     }
     fn import_if_requested(&self) -> std::io::Result<bool> {
@@ -1423,9 +1460,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Relay · PS5 播放器",
         opt,
         Box::new(move |cc| {
-            let app = Relay::new(cc, startup);
-            native_chrome(app.hwnd);
-            Ok(Box::new(app))
+            if startup.ipc {
+                let app = Relay::new(cc, startup);
+                native_chrome(app.hwnd);
+                Ok(Box::new(app))
+            } else {
+                if let Some(RawWindowHandle::Win32(h)) = cc.window_handle().ok().map(|w| w.as_raw())
+                {
+                    native_chrome(h.hwnd.get());
+                }
+                Ok(Box::new(chiaki_ui::PublicApp::new(
+                    &cc.egui_ctx,
+                    startup.install_root,
+                    startup.custom_data_root.then_some(startup.profile_root),
+                    startup.backend_archive,
+                    startup.connect,
+                )))
+            }
         }),
     )
     .map_err(Into::into)
@@ -1433,6 +1484,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod ui_tests {
     use super::*;
+    #[test]
+    fn public_startup_uses_a_verified_gui_for_normal_and_direct_connect() {
+        let root = std::env::temp_dir().join("relay-cli-test");
+        let def = Startup::from_options(root.clone(), None, []).unwrap();
+        assert!(!def.ipc && !def.import_legacy && !def.connect && def.backend_archive.is_none());
+        let profile = root.join("separate profile");
+        let zip = root.join("official archive.zip");
+        let direct = Startup::from_options(
+            root.clone(),
+            Some(profile.clone()),
+            [
+                "--connect".into(),
+                "--backend-archive".into(),
+                zip.clone().into_os_string(),
+            ],
+        )
+        .unwrap();
+        assert!(direct.connect && !direct.ipc && !direct.import_legacy && direct.custom_data_root);
+        assert_eq!(direct.install_root, root);
+        assert_eq!(direct.profile_root, profile);
+        assert_eq!(direct.backend_archive.as_deref(), Some(zip.as_path()));
+        for flags in [
+            vec!["--connect", "--import-legacy"],
+            vec!["--ipc-backend", "--connect"],
+            vec!["--backend-archive"],
+        ] {
+            assert!(
+                Startup::from_options(root.clone(), None, flags.into_iter().map(Into::into))
+                    .is_err()
+            );
+        }
+    }
     #[test]
     fn settings_are_not_frame_confirmation() {
         let saved = json!({"settings":{"neuralRendering":true},"status":{"phase":"idle"}});

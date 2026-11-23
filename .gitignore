@@ -25,3 +25,9 @@ settings.json
 player.json
 .vscode/
 .idea/
+
+# Locally acquired runtime and test fixtures, never release inputs.
+/backends/
+/tests/output/
+*.ini
+*.reg

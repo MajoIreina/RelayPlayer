@@ -2,6 +2,9 @@
 //! console, network, device or existing user data is required.
 #[path = "backend.rs"]
 mod backend;
+#[allow(dead_code)]
+#[path = "chiaki.rs"]
+mod chiaki;
 
 use backend::{Backend, BackendEvent};
 use serde_json::{json, Value};
@@ -15,7 +18,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::Win32::{
-    Foundation::{HANDLE, WAIT_OBJECT_0},
+    Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
 };
 
@@ -148,5 +151,186 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixture()?;
         return Ok(());
     }
-    run_contract()
+    if env::current_exe()?.file_name() == Path::new("relay-profile.exe").file_name() {
+        return gui_fixture();
+    }
+    run_contract()?;
+    run_gui_contract()
+}
+
+// Only the two embedded PowerShell programs are replaced in this test. Launch, proof parsing,
+// path handling, digest checks and process lifetime use the production implementation.
+const PROVIDER_FIXTURE: &str = r#"param([string]$InstallRoot,[string]$ArchivePath)
+if (![IO.File]::Exists($ArchivePath)) { throw 'Missing archive fixture' }
+[IO.File]::WriteAllText([IO.Path]::Combine($InstallRoot,'archive-used'),$ArchivePath)
+[Console]::WriteLine('RELAY verify 1 2')
+"#;
+const PROFILE_FIXTURE: &str = r#"param([string]$InstallRoot,[string]$ProfileRoot)
+if (![IO.Directory]::Exists($ProfileRoot)) {throw 'Missing profile fixture'}
+[IO.File]::WriteAllText([IO.Path]::Combine($InstallRoot,'profile-used'),$ProfileRoot)
+$image = [IO.Path]::Combine($InstallRoot,'chiaki-ng','relay-profile.exe')
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $hash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($image))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
+[Console]::WriteLine('RELAY_PROFILE RTEST2 '+$hash)
+"#;
+const CANCEL_PROVIDER: &str = r#"param([string]$InstallRoot,[string]$ArchivePath)
+$ev = [Threading.EventWaitHandle]::OpenExisting($env:RELAY_PREPARE_CANCEL)
+try {
+ [IO.File]::WriteAllText([IO.Path]::Combine($InstallRoot,'cancel-ready'),'ready')
+ if (!$ev.WaitOne(8000)) { throw 'cancel was not signalled' }
+} finally { $ev.Dispose(); [IO.File]::WriteAllText([IO.Path]::Combine($InstallRoot,'cancel-cleanup'),'done') }
+"#;
+const BAD_PROOF: &str = r#"param([string]$InstallRoot,[string]$ProfileRoot)
+[Console]::WriteLine('RELAY_PROFILE RTEST2 '+('0' * 64))
+"#;
+const FAIL_INSTALL: &str = r#"param([string]$InstallRoot,[string]$ArchivePath)
+[Console]::Error.WriteLine('test: invalid archive digest'); exit 1
+"#;
+
+fn gui_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    assert_eq!(env::current_exe()?, cwd.join("relay-profile.exe"));
+    assert_eq!(env::args_os().count(), 1);
+    assert_eq!(
+        env::var("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS").as_deref(),
+        Ok("1")
+    );
+    for name in [
+        "RELAY_ROOT",
+        "RELAY_DATA",
+        "RELAY_HOST_PID",
+        "RELAY_PLAYER_ROOT",
+    ] {
+        assert!(env::var_os(name).is_none());
+    }
+    let mut marker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(cwd.join("fixture-started"))?;
+    writeln!(marker, "{}", std::process::id())?;
+    let stop = cwd.join("fixture-exit");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !stop.is_file() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(stop.is_file());
+    Ok(())
+}
+fn wait_for_gui(player: &mut chiaki::Player) -> io::Result<chiaki::Update> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match player.poll()? {
+            Some(chiaki::Update::Progress(p)) => assert!(p.done <= p.total),
+            Some(done) => return Ok(done),
+            None => (),
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for player");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let scratch = Scratch(env::temp_dir().join(format!(
+        "Relay GUI 混合 ' $ [x] & {} {stamp}",
+        std::process::id()
+    )));
+    let root = scratch.0.join("播放器");
+    let storage = root.join("backends");
+    let dir = storage.join("chiaki-ng");
+    let profile = scratch.0.join("测试 profile");
+    let zip = scratch.0.join("离线 archive.zip");
+    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&profile)?;
+    fs::write(&zip, b"fixture only")?;
+    // A second, unmodified upstream-like executable is deliberately present; it is never eligible to run.
+    fs::write(dir.join("chiaki.exe"), b"not an eligible process")?;
+    fs::copy(env::current_exe()?, dir.join("relay-profile.exe"))?;
+    let mut player = chiaki::Player::new(root.clone(), Some(profile.clone()), Some(zip.clone()));
+    assert!(matches!(
+        player.begin_fixture(FAIL_INSTALL, PROFILE_FIXTURE)?,
+        chiaki::Open::Preparing
+    ));
+    assert!(wait_for_gui(&mut player)
+        .err()
+        .expect("installer must fail")
+        .to_string()
+        .contains("invalid archive digest"));
+    assert!(!storage.join("profile-used").exists() && !dir.join("fixture-started").exists());
+    player.begin_fixture(CANCEL_PROVIDER, PROFILE_FIXTURE)?;
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !storage.join("cancel-ready").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    player.cancel_preparation();
+    assert!(matches!(
+        wait_for_gui(&mut player)?,
+        chiaki::Update::Cancelled
+    ));
+    assert!(
+        storage.join("cancel-cleanup").is_file()
+            && !storage.join("profile-used").exists()
+            && !dir.join("fixture-started").exists()
+    );
+    player.begin_fixture(PROVIDER_FIXTURE, BAD_PROOF)?;
+    assert!(wait_for_gui(&mut player)
+        .err()
+        .expect("bad proof must fail")
+        .to_string()
+        .contains("校验不一致"));
+    assert!(!dir.join("fixture-started").exists() && !player.running());
+    player.begin_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
+    assert!(matches!(player.open()?, chiaki::Open::AlreadyPreparing));
+    assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Opened));
+    assert!(player.running() && !player.preparing());
+    assert_eq!(
+        Path::new(&fs::read_to_string(storage.join("archive-used"))?),
+        zip
+    );
+    assert_eq!(
+        Path::new(&fs::read_to_string(storage.join("profile-used"))?),
+        profile
+    );
+    let until = Instant::now() + Duration::from_secs(5);
+    while !dir.join("fixture-started").is_file() {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(player.open()?, chiaki::Open::Existing { .. }));
+    assert!(fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("relay-profile.exe"))
+        .is_err());
+    fs::write(dir.join("fixture-exit"), b"stop")?;
+    assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Closed(s) if s.success()));
+    assert!(!player.running() && !root.join("data").exists());
+    // Closing the launcher must not disconnect a live session in the player's own window.
+    fs::remove_file(dir.join("fixture-exit"))?;
+    fs::remove_file(dir.join("fixture-started"))?;
+    player.begin_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
+    assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Opened));
+    let end = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Some(pid) = fs::read_to_string(dir.join("fixture-started"))
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(10));
+    };
+    let handle = process_handle(pid);
+    drop(player);
+    assert_eq!(
+        unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 50) },
+        WAIT_TIMEOUT
+    );
+    fs::write(dir.join("fixture-exit"), b"stop")?;
+    assert_eq!(
+        unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 5000) },
+        WAIT_OBJECT_0
+    );
+    println!("public_gui: PowerShell failed-install stop, graceful cancellation and cleanup, checksum mismatch stop, UTF-16 path arguments, profile isolation handoff, image lock, single child, SDL background events, exit tracking and uninterrupted session after closing host passed");
+    Ok(())
 }

@@ -1,8 +1,8 @@
 [package]
 name = "relay-ps5"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
-description = "基于 egui/eframe 等开源项目构建的 Windows PS5 播放器宿主。串流、采集与画质处理需要另配兼容后端。"
+description = "使用 chiaki-ng 连接 PS5 的 Windows 播放器。"
 build = "build.rs"
 
 [[bin]]
@@ -14,7 +14,7 @@ eframe = { version = "=0.31.1", default-features = false, features = ["default_f
 egui = "=0.31.1"
 serde_json = "1.0"
 raw-window-handle = "0.6"
-windows = { version = "=0.58.0", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security", "Win32_UI_HiDpi", "Win32_System_Variant", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem"] }
+windows = { version = "=0.58.0", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_System_JobObjects", "Win32_Security", "Win32_Security_Cryptography", "Win32_UI_HiDpi", "Win32_System_Variant", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell_PropertiesSystem"] }
 
 [build-dependencies]
 winresource = "0.1"

@@ -2,13 +2,13 @@ Relay · Rust third-party notices / Rust 第三方软件声明
 
 Target: x86_64-pc-windows-msvc · 136 Cargo packages (normal + build dependency graph).
 Rust toolchain used: rustc 1.97.1 (8bab26f4f 2026-07-14)
-Cargo.lock SHA-256: 1b3c8bac48115b559395540a204eaf591b6e87c5806dc0804918b35aecf5e110
+Cargo.lock SHA-256: b5cde9ae1614132a580e2453dd8f58c2f90075182d52e0f4845a5fa0e2194ed1
 
 The index is generated from cargo tree --locked --target x86_64-pc-windows-msvc -e normal,build. It covers dependencies and build-time tools on that target, including proc macros; listing a package does not mean it is shipped separately. Registry checksums and license expressions below are the values from Cargo.lock and the corresponding published Cargo.toml. Authors are package metadata, not a complete list of rights holders. Texts come from the exact source packages, embedded font name tables and, where needed, the upstream repository at the package commit. Identical notices share a text identifier in the appendix.
 
-Rust standard library notices from this toolchain are provided in RUST-STANDARD-LIBRARY.html. This distribution contains the Windows player host; the separate playback backend and its runtime components are not included. Windows system fonts are read from the existing Windows installation; those fonts are not redistributed here.
+Rust standard library notices from this toolchain are provided in RUST-STANDARD-LIBRARY.html. This file covers the Windows player host. The separate chiaki-ng backend and its runtime files are obtained directly from upstream on first use; see CHIAKI-NG.md. Windows system fonts are read from the existing Windows installation; those fonts are not redistributed here.
 
-索引覆盖 Windows x64 构建采用的普通依赖和构建依赖，包括过程宏。条目保留包版本、上游许可表达式及 Cargo.lock 的校验值；文末依编号给出原始许可与署名。Rust 标准库的声明见同目录 RUST-STANDARD-LIBRARY.html。本次公开发行提供 Windows 播放器宿主，不包含独立播放后端及其运行时组件。
+索引覆盖 Windows x64 构建采用的普通依赖和构建依赖，包括过程宏。条目保留包版本、上游许可表达式及 Cargo.lock 的校验值；文末依编号给出原始许可与署名。Rust 标准库的声明见同目录 RUST-STANDARD-LIBRARY.html。本声明覆盖 Windows 播放器宿主。首次使用从上游取得 chiaki-ng 后端和运行库，另见 CHIAKI-NG.md。
 
 === Package index / 依赖索引 ===
 

@@ -1,4 +1,4 @@
-"""Package the public RelayPlayer host from v0.1.7. Python 3.11+ and Git.
+"""Package the PS5-ready public RelayPlayer release from v0.1.8. Python 3.11+ and Git.
 
 Build RelayPlayer.exe from that tag first. This tool checks its format and
 public interface markers; it does not prove binary build provenance. Source and
@@ -18,13 +18,14 @@ import tempfile
 import tomllib
 import zipfile
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 TAG = "v" + VERSION
-HOST = f"RelayPlayer-{VERSION}-windows-x64-host.zip"
+HOST = f"RelayPlayer-{VERSION}-windows-x64.zip"
 SOURCE = f"RelayPlayer-{VERSION}-public-source.zip"
 SUMS = "SHA256SUMS.txt"
-DOCS = ("README.md", "docs/BACKEND.md", "docs/releases/v0.1.7.md",
-        "notices/RUST-THIRD-PARTY.txt", "notices/RUST-STANDARD-LIBRARY.html")
+DOCS = ("README.md", "docs/BACKEND.md", "docs/CHIAKI-PROFILE.md", "docs/releases/v0.1.8.md",
+        "notices/CHIAKI-NG.md", "notices/RUST-THIRD-PARTY.txt", "notices/RUST-STANDARD-LIBRARY.html")
+SCRIPTS = ("tools/ensure-chiaki.ps1", "tools/Initialize-ChiakiProfile.ps1")
 # These three binary inputs are the reviewed output of tools/make_icon.py.
 ICONS = {
     "assets/relay.ico": "70367948c24a0564c3d74ad35ffbbcb49bc789bbdd93f2a2f8461108af7db4f3",
@@ -32,8 +33,9 @@ ICONS = {
     "assets/icon.rgba": "75a7127c1a1890c6d28943d3be15ba5fd163815239c5add47a9fecf892c736d7",
 }
 FILES = frozenset((".gitattributes", ".gitignore", "Cargo.toml", "Cargo.lock", "build.rs",
-                   "tools/make_icon.py", "tools/package_public.py", *DOCS, *ICONS,
-                   *("src/" + s + ".rs" for s in ("backend", "backend_protocol_test", "design", "main", "migration",
+                   "tools/make_icon.py", "tools/package_public.py", "tests/test_chiaki_profile.py",
+                   "docs/releases/v0.1.7.md", *DOCS, *SCRIPTS, *ICONS,
+                   *("src/" + s + ".rs" for s in ("backend", "backend_protocol_test", "chiaki", "chiaki_ui", "design", "main", "migration",
                      "migration_settings_tests", "panels", "platform", "platform_tests"))))
 DIRS = {p.rsplit("/", 1)[0] for p in FILES if "/" in p}
 OID = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -138,6 +140,8 @@ def tagged_source(root):
             scan_values(data, name)
         files[name] = data
     require(tomllib.loads(files["Cargo.toml"].decode())["package"]["version"] == VERSION, "wrong Cargo version")
+    lock = hashlib.sha256(files["Cargo.lock"]).hexdigest().encode("ascii")
+    require(b"Cargo.lock SHA-256: " + lock in files["notices/RUST-THIRD-PARTY.txt"], "dependency notice is stale")
     return files
 
 
@@ -161,9 +165,10 @@ def check_exe(data):
             last = max(last, offset+size)
         runnable |= size > 0 and data[pos:pos+8].rstrip(b"\0") == b".text" and bool(data[pos+39] & 0x20)
     require(runnable and not any(data[last:]), "expected a code section and no appended payload")
-    for marker in ("relay-backend.exe", "RELAY_HOST_PID"):
+    for marker in ("relay-backend.exe", "RELAY_HOST_PID", "relay-profile.exe",
+                   "6ca3f5e6780608104d79345ab7755cfa77fefc33a41ae10651a874c43f54ea57"):
         require(marker.encode() in data or marker.encode("utf-16le") in data,
-                "executable is missing the public backend contract")
+                "executable is missing a required public backend or official archive marker")
     scan_values(data, "RelayPlayer.exe")
     for match in WIDE_ASCII.finditer(data):
         scan_values(match.group()[::2], "RelayPlayer.exe (UTF-16)")
@@ -203,11 +208,15 @@ def assemble(exe, out):
     source = tagged_source(Path(__file__).resolve().parents[1])
     binary = exe.read_bytes()
     check_exe(binary)
+    for name in SCRIPTS:
+        payload = source[name].replace(b"\r\n", b"\n")
+        require(payload in binary or payload.replace(b"\n", b"\r\n") in binary,
+                "executable does not embed the tagged copy of " + name)
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".public-", dir=out) as t:
         stage = Path(t)
         make_zip(stage/SOURCE, source)
-        make_zip(stage/HOST, {"RelayPlayer.exe": binary, **{n: source[n] for n in DOCS}})
+        make_zip(stage/HOST, {"RelayPlayer.exe": binary, **{n: source[n] for n in (*DOCS, *SCRIPTS)}})
         digests = {n: hashlib.sha256((stage/n).read_bytes()).hexdigest() for n in (HOST, SOURCE)}
         (stage/SUMS).write_bytes("".join(f"{h}  {n}\n" for n, h in digests.items()).encode("ascii"))
         created = []
@@ -226,7 +235,7 @@ def assemble(exe, out):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", required=True, type=Path, help="new RelayPlayer.exe built from v0.1.7")
+    parser.add_argument("--exe", required=True, type=Path, help="new RelayPlayer.exe built from v0.1.8")
     parser.add_argument("--out-dir", required=True, type=Path, help="new or empty release output directory")
     args = parser.parse_args()
     try:
