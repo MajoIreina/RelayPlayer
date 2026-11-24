@@ -1,201 +1,304 @@
+//! Public runtime adapter for the original Relay player shell. No second app/layout.
 use crate::{
-    chiaki::{Open, Player, Stage, Update},
-    design::*,
+    chiaki::{Player, Stage, Update},
+    connections::Connections,
 };
-use egui::{
-    vec2, Align, CentralPanel, Context, Frame, Layout, RichText, ScrollArea, TopBottomPanel,
-};
-use std::{path::PathBuf, time::Duration};
+use serde_json::{json, Value};
+use std::{fs, io, path::PathBuf};
 
-pub struct PublicApp {
-    player: Player,
-    note: String,
-    failed: bool,
-    progress: Option<f32>,
-    offline_archive: bool,
-    close_after_cancel: bool,
+pub struct PublicPlayback {
+    pub player: Player,
+    pub note: String,
+    pub progress: Option<f32>,
+    pub settings: Value,
+    pub pending: bool,
+    pub connections: Connections,
+    target: Option<Value>,
+    path: PathBuf,
+    reconnect: bool,
+    capture: bool,
+    devices: bool,
+    changed: Vec<String>,
+    sent_at: Option<std::time::Instant>,
+    last_error: String,
+    remembered_connection: bool,
 }
-impl PublicApp {
+impl PublicPlayback {
     pub fn new(
-        ctx: &Context,
         install: PathBuf,
-        profile: Option<PathBuf>,
+        profile: PathBuf,
+        isolated: bool,
         archive: Option<PathBuf>,
-        auto_connect: bool,
     ) -> Self {
-        setup(ctx);
-        let offline_archive = archive.is_some();
-        let mut app = Self {
-            player: Player::new(install, profile, archive),
-            note: "尚未连接主机。".into(),
-            failed: false,
-            progress: None,
-            offline_archive,
-            close_after_cancel: false,
-        };
-        if auto_connect {
-            app.open();
+        let path = profile.join("data/public-playback.json");
+        let connections = Connections::new(&profile, isolated);
+        let inherited = connections.playback_settings();
+        let saved = fs::read(&path)
+            .ok()
+            .and_then(|v| serde_json::from_slice::<Value>(&v).ok());
+        let mut settings = crate::playback::defaults();
+        for (key, value) in settings.as_object_mut().unwrap() {
+            if let Some(v) = inherited.get(key).filter(|v| valid_setting(key, v)) {
+                *value = v.clone();
+            }
         }
-        app
-    }
-    fn open(&mut self) {
-        match self.player.open() {
-            Ok(state) => {
-                self.failed = false;
-                self.note = match state {
-                    Open::Preparing | Open::AlreadyPreparing => "正在检查串流组件……",
-                    Open::Existing { raised: true } => "已切换到连接窗口。",
-                    Open::Existing { raised: false } => {
-                        "连接窗口正在运行，可从 Windows 任务栏切换到 chiaki-ng。"
-                    }
+        if let Some(saved) = saved {
+            for (key, value) in settings.as_object_mut().unwrap() {
+                if let Some(v) = saved.get(key).filter(|v| valid_setting(key, v)) {
+                    *value = v.clone();
                 }
-                .into();
             }
-            Err(e) => {
-                self.note = e.to_string();
-                self.failed = true;
-                self.progress = None;
-            }
+        }
+        Self {
+            connections,
+            player: Player::new(install, isolated.then_some(profile), archive),
+            path,
+            settings,
+            note: "选择主机连接；首次使用会自动准备串流组件。".into(),
+            progress: None,
+            pending: false,
+            target: None,
+            reconnect: false,
+            capture: false,
+            devices: false,
+            changed: Vec::new(),
+            sent_at: None,
+            last_error: String::new(),
+            remembered_connection: false,
         }
     }
-}
-impl eframe::App for PublicApp {
-    fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.player.preparing() {
-            self.close_after_cancel = true;
-            self.player.cancel_preparation();
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+    pub fn stop(&mut self) -> io::Result<()> {
+        self.reconnect = false;
+        self.capture = false;
+        self.devices = false;
+        self.pending = false;
+        self.changed.clear();
+        self.sent_at = None;
+        self.player.close()?;
+        self.note = "正在断开本次播放……".into();
+        Ok(())
+    }
+    pub fn feedback(&self) -> Value {
+        let f = self.player.render_feedback();
+        let stats = &f["stats"];
+        let pending = self.pending
+            || (self.player.running()
+                && stats["revision"].as_u64().unwrap_or(0) < self.player.render_revision());
+        let up = &self.settings["upscaler"];
+        json!({"pendingSettings":if pending{self.changed.clone()}else{Vec::new()},
+            "upscaler":{"requested":up,"actual":stats["activeUpscaler"],"state":if stats["upscalerUnavailable"]==true{"error"}else if up!="off" && stats["activeUpscaler"]=="off"{"no-scaling"}else{"active"},"reason":if stats["upscalerUnavailable"]==true{"当前显卡、驱动或运行库无法启用所选算法。"}else{""}},
+            "bitrateLock":{"state":if self.settings["lockBitrate"]==true{if self.pending{"pending-reconnect"}else{"locked"}}else{"off"},"targetKbps":self.settings["bitrateKbps"]}})
+    }
+    pub fn connect(&mut self, args: &Value) -> io::Result<()> {
+        if !self.connections.operation.is_empty() {
+            return Err(io::Error::other("请等待连接操作完成。"));
         }
-        match self.player.poll() {
-            Ok(Some(Update::Cancelled)) => {
-                self.note = "已取消后端准备。".into();
-                self.failed = false;
+        let target = self.connections.target(args)?;
+        self.remembered_connection = false;
+        self.last_error.clear();
+        self.capture = false;
+        self.devices = false;
+        self.player
+            .set_playback_settings(crate::playback::session_settings(&self.settings).to_string())?;
+        self.player.set_render_settings(&self.settings)?;
+        self.player
+            .prepare_stream(self.settings["neuralRendering"] == true)?;
+        self.target = Some(target);
+        self.note = "正在检查串流组件……".into();
+        Ok(())
+    }
+    pub fn capture(&mut self, args: &Value) -> io::Result<()> {
+        let id = args["deviceId"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("请选择采集设备。"))?;
+        self.save(&json!({"captureDeviceId":id,"pictureSource":"capture"}))?;
+        self.capture = true;
+        self.devices = false;
+        if self.player.running() {
+            return Ok(());
+        }
+        self.player
+            .set_playback_settings(crate::playback::session_settings(&self.settings).to_string())?;
+        self.player.set_render_settings(&self.settings)?;
+        self.player.prepare_stream(false)?;
+        Ok(())
+    }
+    pub fn devices(&mut self) -> io::Result<()> {
+        if self.player.running() {
+            return self.player.send_control(&json!({"type":"devices"}));
+        }
+        self.devices = true;
+        self.capture = false;
+        self.player.prepare_stream(false)?;
+        self.note = "正在准备设备枚举组件……".into();
+        Ok(())
+    }
+    pub fn unlock(&mut self, args: &Value) -> io::Result<()> {
+        let pin = args["pin"]
+            .as_str()
+            .filter(|pin| pin.len() == 4 && pin.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| io::Error::other("主机解锁码须为 4 位数字。"))?;
+        self.player.send_control(&json!({"type":"pin","pin":pin}))
+    }
+    pub fn save(&mut self, patch: &Value) -> io::Result<()> {
+        let object = patch
+            .as_object()
+            .ok_or_else(|| io::Error::other("设置格式无效。"))?;
+        if object.iter().any(|(k, v)| !valid_setting(k, v)) {
+            return Err(io::Error::other(
+                "当前后端尚未接入此参数；未将不支持的选项标记为生效。",
+            ));
+        }
+        if self.player.preparing() {
+            return Err(io::Error::other("请等待组件准备完成或取消后再调整设置。"));
+        }
+        let mut next = self.settings.clone();
+        for (k, v) in object {
+            next[k] = v.clone();
+        }
+        fs::create_dir_all(self.path.parent().unwrap())?;
+        let tmp = self.path.with_extension("tmp");
+        fs::write(&tmp, next.to_string())?;
+        fs::rename(tmp, &self.path)?;
+        let needs_reconnect = self.player.running()
+            && object
+                .iter()
+                .any(|(k, v)| crate::playback::session_key(k) && self.settings[k] != *v);
+        self.changed = object.keys().cloned().collect();
+        self.sent_at = Some(std::time::Instant::now());
+        self.settings = next;
+        self.player.set_render_settings(&self.settings)?;
+        self.pending = needs_reconnect;
+        if needs_reconnect {
+            self.reconnect = true;
+            self.player.close()?;
+        }
+        self.note = if self.pending {
+            "正在重新连接以应用串流参数。"
+        } else {
+            "设置已发送；播放时由渲染器确认，空闲时在连接后应用。"
+        }
+        .into();
+        Ok(())
+    }
+    pub fn poll(&mut self) -> io::Result<()> {
+        match self.player.poll()? {
+            Some(Update::Ready) => {
+                if self.devices || self.capture {
+                    self.player.launch_capture(self.devices)?;
+                    self.note = if self.devices {
+                        "正在枚举视频设备……"
+                    } else {
+                        "正在打开采集设备……"
+                    }
+                    .into();
+                    self.progress = None;
+                    return Ok(());
+                }
+                let target = self
+                    .target
+                    .clone()
+                    .ok_or_else(|| io::Error::other("未选择连接主机。"))?;
+                self.connections.write_runtime_host(&target)?;
+                self.player.launch_stream(
+                    &Connections::runtime_nickname(&target),
+                    target["ipAddress"].as_str().unwrap_or_default(),
+                )?;
+                self.pending = false;
                 self.progress = None;
+                self.note = "正在连接 PS5，等待视频画面……".into();
             }
-            Ok(Some(Update::Progress(_))) if self.player.cancelling() => (),
-            Ok(Some(Update::Progress(p))) => {
+            Some(Update::Progress(p)) => {
                 self.progress = Some(p.done as f32 / p.total as f32);
                 self.note = match p.stage {
-                    Stage::Waiting => "另一实例正在准备串流组件，请稍候……".into(),
+                    Stage::Waiting => "等待另一实例完成组件准备……".into(),
                     Stage::Download => format!(
-                        "正在从 chiaki-ng 官方 GitHub 下载：{:.0} / {:.0} MiB",
+                        "正在下载组件：{:.0} / {:.0} MiB",
                         p.done as f64 / 1048576.,
                         p.total as f64 / 1048576.
                     ),
-                    Stage::Extract => format!("正在解压：{} / {} 个文件", p.done, p.total),
-                    Stage::Verify => format!("正在校验组件：{} / {} 个文件", p.done, p.total),
-                    Stage::Profile => "正在准备此 Windows 用户的独立配置……".into(),
-                    Stage::Ready => "串流组件已校验。".into(),
+                    Stage::Extract => format!("正在解压：{} / {}", p.done, p.total),
+                    Stage::Verify => format!("正在校验：{} / {}", p.done, p.total),
+                    Stage::Profile => "正在应用播放设置与手柄修复……".into(),
+                    Stage::Ready => "组件已校验。".into(),
                 };
             }
-            Ok(Some(Update::Opened)) => {
-                self.note = "已打开 chiaki-ng。请在连接窗口中配对或选择你的 PS5。".into();
+            Some(Update::Opened) => {
+                self.pending = false;
                 self.progress = None;
-                self.failed = false;
+                self.note = "正在连接 PS5，等待视频画面……".into();
             }
-            Ok(Some(Update::Closed(exit))) if exit.success() => {
-                self.note = "连接窗口已关闭。可再次打开，选择已配对的 PS5。".into();
-                self.failed = false;
-            }
-            Ok(Some(Update::Closed(exit))) => {
-                let code = exit
-                    .code()
-                    .map(|n| format!("0x{:08X}", n as u32))
-                    .unwrap_or_else(|| exit.to_string());
-                self.note = format!(
-                    "连接窗口异常退出（{code}）。请检查显卡驱动后重试；若持续退出，请记录此代码。"
-                );
-                self.failed = true;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                self.note = e.to_string();
+            Some(Update::Closed(status)) => {
                 self.progress = None;
-                self.failed = true;
-            }
-        }
-        if self.player.cancelling() {
-            self.note = "正在取消准备并清理临时文件……".into();
-        }
-        if self.close_after_cancel && !self.player.preparing() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        let running = self.player.running();
-        let preparing = self.player.preparing();
-        if preparing {
-            ctx.request_repaint_after(Duration::from_millis(120));
-        } else if running {
-            ctx.request_repaint_after(Duration::from_millis(500));
-        }
-        TopBottomPanel::top("public_header")
-            .frame(
-                Frame::NONE
-                    .fill(BAR)
-                    .inner_margin(egui::Margin::symmetric(22, 12)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(33., 33.), egui::Sense::hover());
-                    brand(ui.painter(), r.center());
-                    ui.add_space(5.);
-                    ui.label(RichText::new("Relay").font(strong(20.)));
-                    ui.label(RichText::new(" /  PS5 播放器").color(MUTED));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).color(DIM));
-                    });
-                });
-            });
-        TopBottomPanel::bottom("public_state")
-            .frame(
-                Frame::NONE
-                    .fill(BAR)
-                    .inner_margin(egui::Margin::symmetric(22, 12)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("状态").color(if self.failed { WARN } else { ACCENT }));
-                    ui.label(RichText::new(&self.note).color(if self.failed {
-                        WARN
-                    } else {
-                        MUTED
-                    }));
-                });
-            });
-        CentralPanel::default().frame(Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(28, 18))).show(ctx, |ui| {
-            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    let compact = ui.available_height() < 445.;
-                    ui.add_space(if compact { 2. } else { 12. });
-                    let (art, _) = ui.allocate_exact_size(vec2(180., if compact { 60. } else { 83. }), egui::Sense::hover());
-                    idle_art(ui.painter(), art.center(), if compact { 0.56 } else { 0.75 });
-                    ui.heading(RichText::new("连接你的 PS5").font(strong(26.)));
-                    ui.label(RichText::new("使用网络遥控游玩，无需采集卡。").color(MUTED));
-                    ui.add_space(8.);
-                    let caption = if preparing { "正在准备连接窗口…" } else if running { "返回连接窗口" } else { "配对 / 连接 PS5" };
-                    if ui.add_enabled(!preparing, egui::Button::new(RichText::new(caption).font(strong(16.)).color(INK))
-                        .fill(ACCENT).min_size(vec2(204., 41.)).corner_radius(7)).clicked() { self.open(); ctx.request_repaint(); }
-                    if preparing {
-                        if let Some(f) = self.progress { ui.add(egui::ProgressBar::new(f).desired_width(204.).fill(ACCENT)); }
-                        if ui.add_enabled(!self.player.cancelling(), egui::Button::new("取消准备")).clicked() { self.player.cancel_preparation(); ctx.request_repaint(); }
-                    } else {
-                        let hint = if self.offline_archive { "使用指定的官方离线包；校验通过后打开。" } else { "首次自动从官方 GitHub 下载约 113 MiB；以后使用本地副本。" };
-                        ui.label(RichText::new(hint).size(12.).color(DIM));
+                if self.reconnect {
+                    self.reconnect = false;
+                    if self.capture {
+                        let id = self.settings["captureDeviceId"].clone();
+                        return self.capture(&json!({"deviceId":id}));
                     }
-                    ui.add_space(if compact { 12. } else { 21. });
-                    let width = ui.available_width().min(760.);
-                    ui.allocate_ui_with_layout(vec2(width, 0.), Layout::top_down(Align::Min), |ui| {
-                        Frame::NONE.fill(BAR).corner_radius(10).inner_margin(egui::Margin::symmetric(18, 13)).show(ui, |ui| {
-                            ui.set_width((width - 36.).max(1.));
-                            ui.label(RichText::new("首次配对").font(strong(16.)));
-                            for (n, text) in [
-                                ("1", "让电脑和 PS5 连接同一网络，在 PS5 上打开「设定 → 系统 → 远程游玩」，选择「启动远程游玩」。"),
-                                ("2", "打开连接窗口并选择发现的 PS5。首次注册按提示确认账户；若需要配对码，在 PS5 上选择「配对设备」查看 8 位码。"),
-                                ("3", "注册后选择主机开始播放。视频、音频、全屏和手柄设置均在 chiaki-ng 窗口中调整。"),
-                            ] { ui.horizontal_top(|ui| { ui.label(RichText::new(n).font(strong(14.)).color(ACCENT)); ui.label(RichText::new(text).color(MUTED)); }); }
-                        });
-                    });
-                });
-            });
-        });
+                    let target = self
+                        .target
+                        .clone()
+                        .ok_or_else(|| io::Error::other("未选择主机。"))?;
+                    return self.connect(&target);
+                }
+                self.note = if status.success() {
+                    "本次连接已关闭。".into()
+                } else {
+                    format!("连接窗口退出：{status}。")
+                };
+            }
+            Some(Update::Cancelled) => {
+                self.progress = None;
+                self.note = "已取消组件准备。".into();
+            }
+            None => (),
+        }
+        let f = self.player.render_feedback();
+        if !self.capture && !self.remembered_connection && self.player.video_received() {
+            self.remembered_connection = true;
+            self.note = "已连接 PS5，正在播放。".into();
+            if let Some(target) = &self.target {
+                if let Err(e) = self.connections.remember_connected(target) {
+                    self.note = format!("画面已连接，但最近主机记录未保存：{e}");
+                }
+            }
+        }
+        if let Some(error) = f["error"]["message"].as_str() {
+            if error != self.last_error {
+                self.last_error = error.to_owned();
+                self.note = format!("播放组件：{error}");
+            }
+        } else if self.player.running() && !self.pending && !self.changed.is_empty() {
+            if f["stats"]["revision"].as_u64().unwrap_or(0) >= self.player.render_revision() {
+                self.changed.clear();
+                self.sent_at = None;
+                self.note = "渲染器已处理新视频帧，设置已应用。".into();
+            } else if self.sent_at.is_some_and(|t| t.elapsed().as_secs() > 15) {
+                self.sent_at = None;
+                self.note = "设置尚未获得视频帧确认，请查看运行状态中的算法与硬件信息。".into();
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_setting(key: &str, value: &Value) -> bool {
+    crate::playback::valid(key, value)
+}
+pub fn supported_setting(key: &str) -> bool {
+    crate::playback::supported(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn playback_settings_are_bounded_and_never_accept_credentials_or_fake_algorithms() {
+        assert!(valid_setting("bitrateKbps", &json!(200000)));
+        assert!(!valid_setting("bitrateKbps", &json!(200001)));
+        assert!(!valid_setting("bitrateKbps", &json!(-1)));
+        assert!(valid_setting("upscaler", &json!("rtx-vsr")));
+        assert!(!valid_setting("token", &json!("fixture")));
     }
 }

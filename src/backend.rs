@@ -67,7 +67,7 @@ fn event(mut frame: Value) -> Option<BackendEvent> {
     }
 }
 
-fn private_job() -> io::Result<OwnedHandle> {
+pub(crate) fn private_job() -> io::Result<OwnedHandle> {
     unsafe {
         let raw = CreateJobObjectW(None, PCWSTR::null()).map_err(io::Error::other)?;
         let job = OwnedHandle::from_raw_handle(raw.0);

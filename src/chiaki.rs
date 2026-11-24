@@ -15,9 +15,10 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
-        Arc,
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 use windows::core::HSTRING;
 use windows::Win32::{
@@ -27,24 +28,30 @@ use windows::Win32::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     },
     System::{
+        JobObjects::AssignProcessToJobObject,
         SystemInformation::GetSystemDirectoryW,
-        Threading::{CreateEventW, SetEvent, CREATE_NO_WINDOW},
+        Threading::{CreateEventW, SetEvent, WaitForSingleObject, CREATE_NO_WINDOW},
     },
     UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-        SetForegroundWindow, ShowWindowAsync, SW_RESTORE,
+        EnumChildWindows, EnumWindows, GetParent, GetWindowTextLengthW, GetWindowThreadProcessId,
+        IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindowAsync, SW_RESTORE,
+        WM_CLOSE,
     },
 };
 
 const INSTALL_SCRIPT: &str = include_str!("../tools/ensure-chiaki.ps1");
+const RENDER_INSTALL_SCRIPT: &str = include_str!("../tools/ensure-relay-render.ps1");
 const PROFILE_SCRIPT: &str = include_str!("../tools/Initialize-ChiakiProfile.ps1");
 const INSTALL_ROOT: &str = "RELAY_PREPARE_DIR";
 const ARCHIVE: &str = "RELAY_PREPARE_ARCHIVE";
 const DATA_ROOT: &str = "RELAY_PREPARE_PROFILE";
+const NR: &str = "RELAY_PREPARE_NR";
+const MODEL: &str = "RELAY_NR_MODEL";
+const SETTINGS: &str = "RELAY_PLAYBACK_SETTINGS";
 const CANCEL: &str = "RELAY_PREPARE_CANCEL";
 // Only these constant instructions are parsed from the command line. The reviewed installer arrives
 // over stdin from our executable. Paths stay OS strings in the child environment, never shell text.
-const RUN_SCRIPT: &str = r#"$ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try{$s=[ScriptBlock]::Create([Console]::In.ReadToEnd().TrimStart([char]0xfeff));$parameters=@{InstallRoot=$env:RELAY_PREPARE_DIR};if($env:RELAY_PREPARE_ARCHIVE){$parameters.ArchivePath=$env:RELAY_PREPARE_ARCHIVE};if($env:RELAY_PREPARE_PROFILE){$parameters.ProfileRoot=$env:RELAY_PREPARE_PROFILE};& $s @parameters}catch{[Console]::Error.WriteLine('Could not run the embedded backend installer.');exit 1}"#;
+const RUN_SCRIPT: &str = r#"$ErrorActionPreference='Stop';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try{$s=[ScriptBlock]::Create([Console]::In.ReadToEnd().TrimStart([char]0xfeff));$parameters=@{InstallRoot=$env:RELAY_PREPARE_DIR};if($env:RELAY_PREPARE_NR -eq '1'){$parameters.CommunityNr=$true};if($env:RELAY_RENDER_PREPARE -eq '1'){$parameters.RelayRender=$true};if($env:RELAY_PREPARE_ARCHIVE){$parameters.ArchivePath=$env:RELAY_PREPARE_ARCHIVE};if($env:RELAY_PREPARE_PROFILE){$parameters.ProfileRoot=$env:RELAY_PREPARE_PROFILE};& $s @parameters}catch{[Console]::Error.WriteLine('Could not run the embedded backend installer.');exit 1}"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -84,7 +91,7 @@ impl Progress {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 struct Proof([u8; 32]);
 impl Proof {
     fn parse(line: &str) -> Option<Self> {
@@ -155,7 +162,23 @@ impl Stop {
         self.requested.load(Ordering::Acquire)
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    Standard,
+    CommunityNr,
+    RelayRender,
+}
+impl Provider {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Standard => "chiaki-ng",
+            Self::CommunityNr => "chiaki-nr",
+            Self::RelayRender => "relay-render",
+        }
+    }
+}
 struct Preparation {
+    provider: Provider,
     rx: Receiver<InstallEvent>,
     stop: Arc<Stop>,
     worker: Option<JoinHandle<()>>,
@@ -187,6 +210,9 @@ fn run_script(
     root: &Path,
     archive: Option<&Path>,
     profile: Option<&Path>,
+    provider: Provider,
+    model: Option<&Path>,
+    settings: Option<&str>,
     script: &'static str,
     report: &Sender<InstallEvent>,
     stop: &Stop,
@@ -204,19 +230,37 @@ fn run_script(
             "-Command",
             RUN_SCRIPT,
         ])
+        .env_remove("PSModulePath")
         .env(INSTALL_ROOT, root)
         .env(CANCEL, &stop.name)
         .env_remove(ARCHIVE)
         .env_remove(DATA_ROOT)
+        .env_remove(NR)
+        .env_remove(MODEL)
+        .env_remove(SETTINGS)
         .creation_flags(CREATE_NO_WINDOW.0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if provider == Provider::RelayRender {
+        cmd.env("RELAY_RENDER_PREPARE", "1");
+    } else {
+        cmd.env_remove("RELAY_RENDER_PREPARE");
+    }
+    if provider == Provider::CommunityNr {
+        cmd.env(NR, "1");
+        if let Some(path) = model {
+            cmd.env(MODEL, path);
+        }
+    }
     if let Some(path) = archive {
         cmd.env(ARCHIVE, path);
     }
     if let Some(path) = profile {
         cmd.env(DATA_ROOT, path);
+    }
+    if let Some(value) = settings {
+        cmd.env(SETTINGS, value);
     }
     let mut proc = cmd.spawn().map_err(|e| {
         io::Error::new(e.kind(), format!("无法启动系统 PowerShell 准备播放器：{e}"))
@@ -297,8 +341,217 @@ fn ordinary(root: &Path, relative: &[&str]) -> io::Result<PathBuf> {
 }
 
 struct Session {
+    provider: Provider,
     child: Child,
+    job: Option<OwnedHandle>,
     _image_lock: File,
+    video_received: Arc<AtomicBool>,
+    feedback: Arc<Mutex<serde_json::Value>>,
+    stats_at: Arc<Mutex<Option<Instant>>>,
+    closing_since: Option<Instant>,
+    revision: u64,
+    drainers: Vec<JoinHandle<()>>,
+}
+// The embedded video has a foreign parent and is absent from EnumWindows.
+// Walk that parent's children too, but message only roots belonging to our exact PID.
+unsafe extern "system" fn close_owned_window(window: HWND, cookie: LPARAM) -> BOOL {
+    let pid = cookie.0 as u32;
+    let mut owner = 0;
+    GetWindowThreadProcessId(window, Some(&mut owner));
+    if owner == pid {
+        let mut parent_pid = 0;
+        if let Ok(parent) = GetParent(window) {
+            GetWindowThreadProcessId(parent, Some(&mut parent_pid));
+        }
+        if parent_pid != pid {
+            let _ = PostMessageW(window, WM_CLOSE, None, None);
+        }
+    }
+    BOOL(1)
+}
+unsafe extern "system" fn close_owned_tree(window: HWND, cookie: LPARAM) -> BOOL {
+    let _ = close_owned_window(window, cookie);
+    let _ = EnumChildWindows(window, Some(close_owned_window), cookie);
+    BOOL(1)
+}
+impl Session {
+    fn request_close(&mut self) {
+        if self.closing_since.is_some() {
+            return;
+        }
+        self.closing_since = Some(Instant::now());
+        if self.provider == Provider::RelayRender {
+            if let Some(input) = self.child.stdin.as_mut() {
+                let _ = writeln!(input, "{{\"type\":\"stop\"}}").and_then(|_| input.flush());
+            }
+        } else {
+            unsafe {
+                let _ = EnumWindows(Some(close_owned_tree), LPARAM(self.child.id() as isize));
+            }
+        }
+    }
+    fn shutdown(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            self.request_close();
+            // EOF also allows a headless or not-yet-created renderer to exit.
+            self.child.stdin.take();
+            unsafe {
+                let remaining = Duration::from_millis(750)
+                    .saturating_sub(self.closing_since.unwrap().elapsed());
+                WaitForSingleObject(
+                    HANDLE(self.child.as_raw_handle()),
+                    remaining.as_millis() as u32,
+                );
+            }
+        }
+        // Close the private kill-on-close job before joining readers: a helper may
+        // have inherited stdout even after the main renderer exited normally.
+        self.job.take();
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        for reader in self.drainers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+fn video_packet_report(line: &str) -> bool {
+    line.split_once("Switched to profile ")
+        .is_some_and(|(_, rest)| {
+            let Some((index, size)) = rest.split_once(", resolution: ") else {
+                return false;
+            };
+            let Some((w, h)) = size.trim().split_once('x') else {
+                return false;
+            };
+            index.parse::<u32>().is_ok()
+                && w.parse::<u32>().is_ok_and(|v| v > 0 && v <= 16384)
+                && h.parse::<u32>().is_ok_and(|v| v > 0 && v <= 16384)
+        })
+}
+fn normalize_stats(mut stats: serde_json::Value) -> serde_json::Value {
+    if stats["bitrateKbps"].is_null() {
+        if let Some(mbps) = stats["bitrateMbps"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.)
+        {
+            stats["bitrateKbps"] = serde_json::json!(mbps * 1000.);
+        }
+    }
+    if stats["outputFps"].is_null() {
+        if let Some(fps) = stats["displayFps"]
+            .as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.)
+        {
+            stats["outputFps"] = serde_json::json!(fps);
+        }
+    }
+    let legacy_backend = stats["frameGeneration"].as_i64().or_else(|| {
+        stats["frameGeneration"]
+            .as_str()
+            .and_then(|v| v.parse::<i64>().ok())
+    });
+    if let Some(code) = legacy_backend {
+        let backend = match code {
+            0 => "off",
+            1 => "dlssg",
+            2 => "fsr",
+            3 => "flow",
+            4 => "nvidia-vfg",
+            5 => "dlssg-dx12",
+            _ => "unknown",
+        };
+        stats["frameGeneration"] = serde_json::json!(backend);
+        stats["frameGenerationBackend"] = serde_json::json!(backend);
+    }
+    stats
+}
+fn stats_fresh(seen: Option<Instant>, stopping: bool) -> bool {
+    !stopping && seen.is_some_and(|at| at.elapsed() < Duration::from_secs(4))
+}
+fn drain_feedback(
+    output: impl Read + Send + 'static,
+    flag: Arc<AtomicBool>,
+    feedback: Arc<Mutex<serde_json::Value>>,
+    stats_at: Arc<Mutex<Option<Instant>>>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("relay-stream-feedback".into())
+        .spawn(move || {
+            let mut input = BufReader::new(output);
+            // Keep no raw logs or credentials. Bound each line even for malformed output.
+            loop {
+                let mut line = Vec::new();
+                let Ok(n) = input.by_ref().take(8193).read_until(b'\n', &mut line) else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                if line.len() <= 8192 {
+                    if let Some(raw) = std::str::from_utf8(&line)
+                        .ok()
+                        .and_then(|l| l.strip_prefix("RELAY_RENDER "))
+                    {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+                            if matches!(
+                                value["type"].as_str(),
+                                Some(
+                                    "stats"
+                                        | "settingsAccepted"
+                                        | "error"
+                                        | "devices"
+                                        | "pinRequired"
+                                        | "sessionEnded"
+                                )
+                            ) {
+                                let mut state = feedback.lock().unwrap();
+                                if value["type"] == "stats" {
+                                    if value["width"].as_u64().is_some_and(|n| n > 0)
+                                        && value["height"].as_u64().is_some_and(|n| n > 0)
+                                    {
+                                        flag.store(true, Ordering::Release);
+                                    }
+                                    state["stats"] = normalize_stats(value);
+                                    *stats_at.lock().unwrap() = Some(Instant::now());
+                                } else {
+                                    let kind = value["type"].as_str().unwrap_or("event").to_owned();
+                                    state[&kind] = value.clone();
+                                    if kind == "sessionEnded" && value["error"] == true {
+                                        state["error"] = serde_json::json!({"type":"error","message":format!("串流会话已退出：{}",value["reason"].as_str().unwrap_or("未知原因"))});
+                                    }
+                                    state["event"] = value;
+                                }
+                            }
+                        }
+                    }
+                }
+                if line.len() <= 8192 && video_packet_report(&String::from_utf8_lossy(&line)) {
+                    flag.store(true, Ordering::Release);
+                }
+                if line.last() != Some(&b'\n') {
+                    loop {
+                        line.clear();
+                        let Ok(n) = input.by_ref().take(8193).read_until(b'\n', &mut line) else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        if line.last() == Some(&b'\n') {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .expect("feedback reader thread")
 }
 pub struct Player {
     root: PathBuf,
@@ -306,7 +559,14 @@ pub struct Player {
     archive: Option<PathBuf>,
     preparing: Option<Preparation>,
     session: Option<Session>,
+    settings: Option<String>,
+    prepare_only: bool,
+    prepared: Option<(Proof, Provider)>,
+    stream_args: Vec<OsString>,
+    render_settings: serde_json::Value,
+    last_feedback: serde_json::Value,
 }
+#[allow(dead_code)]
 pub enum Open {
     Preparing,
     AlreadyPreparing,
@@ -315,6 +575,7 @@ pub enum Open {
 pub enum Update {
     Progress(Progress),
     Opened,
+    Ready,
     Closed(ExitStatus),
     Cancelled,
 }
@@ -327,10 +588,103 @@ impl Player {
             archive,
             preparing: None,
             session: None,
+            settings: None,
+            prepare_only: false,
+            prepared: None,
+            stream_args: Vec::new(),
+            render_settings: serde_json::json!({}),
+            last_feedback: serde_json::json!({}),
         }
     }
     pub fn running(&self) -> bool {
         self.session.is_some()
+    }
+    pub fn playback_pid(&self) -> u32 {
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.child.id())
+    }
+    pub fn video_received(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.closing_since.is_none() && s.video_received.load(Ordering::Acquire))
+    }
+    pub fn stopping(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.closing_since.is_some())
+    }
+    pub fn render_revision(&self) -> u64 {
+        self.session.as_ref().map_or(0, |s| s.revision)
+    }
+    pub fn render_feedback(&self) -> serde_json::Value {
+        let mut feedback = self
+            .session
+            .as_ref()
+            .map(|s| s.feedback.lock().unwrap().clone())
+            .unwrap_or_else(|| self.last_feedback.clone());
+        let fresh = self
+            .session
+            .as_ref()
+            .is_some_and(|s| stats_fresh(*s.stats_at.lock().unwrap(), s.closing_since.is_some()));
+        if !fresh {
+            let stale = self.session.is_some() && !feedback["stats"].is_null();
+            feedback["stats"] = serde_json::Value::Null;
+            feedback["telemetryStale"] = serde_json::json!(stale);
+        }
+        feedback
+    }
+    pub fn send_control(&mut self, command: &serde_json::Value) -> io::Result<()> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| io::Error::other("播放组件尚未启动。"))?;
+        let input = session
+            .child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::other("渲染控制通道已关闭。"))?;
+        writeln!(input, "{}", command)?;
+        input.flush()
+    }
+    pub fn set_render_settings(&mut self, settings: &serde_json::Value) -> io::Result<()> {
+        if let Some(session) = &mut self.session {
+            session.revision += 1;
+            let command = serde_json::json!({"type":"settings","revision":session.revision,"settings":settings});
+            let input = session
+                .child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| io::Error::other("渲染控制通道已关闭。"))?;
+            writeln!(input, "{}", command)?;
+            input.flush()?;
+        }
+        self.render_settings = settings.clone();
+        Ok(())
+    }
+    pub fn set_playback_settings(&mut self, settings: String) -> io::Result<()> {
+        if self.preparing() {
+            return Err(io::Error::other("正在准备组件，请稍候。"));
+        }
+        self.settings = Some(settings);
+        Ok(())
+    }
+    pub fn close(&mut self) -> io::Result<()> {
+        if self.preparing() {
+            self.cancel_preparation();
+            return Ok(());
+        }
+        if let Some(session) = &mut self.session {
+            session.request_close();
+        }
+        Ok(())
+    }
+    pub fn shutdown(&mut self) {
+        // End playback while its surface is still embedded; detaching first would
+        // briefly restore a second, visible top-level playback window.
+        self.session.take();
+        self.preparing.take();
+        self.prepared = None;
     }
     pub fn preparing(&self) -> bool {
         self.preparing.is_some()
@@ -343,15 +697,85 @@ impl Player {
     pub fn cancelling(&self) -> bool {
         self.preparing.as_ref().is_some_and(|p| p.stop.requested())
     }
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn open(&mut self) -> io::Result<Open> {
-        self.begin(INSTALL_SCRIPT, PROFILE_SCRIPT)
+        self.begin(Provider::Standard, None, INSTALL_SCRIPT, PROFILE_SCRIPT)
     }
-    fn begin(&mut self, installer: &'static str, initializer: &'static str) -> io::Result<Open> {
-        if self.preparing.is_some() {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn open_nr(&mut self, model: Option<PathBuf>) -> io::Result<Open> {
+        self.begin(Provider::CommunityNr, model, INSTALL_SCRIPT, PROFILE_SCRIPT)
+    }
+    /// Provision without ever creating the upstream management UI.
+    pub fn prepare_stream(&mut self, nr: bool) -> io::Result<()> {
+        if self.running() || self.preparing() {
+            return Err(io::Error::other("请先结束当前连接或组件准备。"));
+        }
+        self.prepare_only = true;
+        self.prepared = None;
+        let _ = nr;
+        self.begin(Provider::RelayRender, None, INSTALL_SCRIPT, PROFILE_SCRIPT)?;
+        Ok(())
+    }
+    pub fn launch_capture(&mut self, devices: bool) -> io::Result<()> {
+        let (proof, provider) = self
+            .prepared
+            .take()
+            .ok_or_else(|| io::Error::other("播放组件尚未准备。"))?;
+        self.stream_args = vec![
+            "--".into(),
+            if devices {
+                "relay-devices"
+            } else {
+                "relay-capture"
+            }
+            .into(),
+        ];
+        self.session = Some(self.start_verified(proof, provider)?);
+        Ok(())
+    }
+    pub fn launch_stream(&mut self, nickname: &str, host: &str) -> io::Result<()> {
+        if nickname.is_empty()
+            || nickname.chars().any(char::is_control)
+            || host.is_empty()
+            || host.chars().any(char::is_control)
+        {
+            return Err(io::Error::other("主机名称或连接地址无效。"));
+        }
+        let (proof, provider) = self
+            .prepared
+            .take()
+            .ok_or_else(|| io::Error::other("串流组件尚未校验。"))?;
+        self.stream_args = vec![
+            "--dualsense".into(),
+            "--exit-app-on-stream-exit".into(),
+            "--".into(),
+            "stream".into(),
+            nickname.into(),
+            host.into(),
+        ];
+        self.session = Some(self.start_verified(proof, provider)?);
+        Ok(())
+    }
+    fn begin(
+        &mut self,
+        provider: Provider,
+        model: Option<PathBuf>,
+        installer: &'static str,
+        initializer: &'static str,
+    ) -> io::Result<Open> {
+        if let Some(prep) = &self.preparing {
+            if prep.provider != provider {
+                return Err(io::Error::other("请先取消当前串流组件的准备，再切换模式。"));
+            }
             return Ok(Open::AlreadyPreparing);
         }
         if let Some(session) = &mut self.session {
             if session.child.try_wait()?.is_none() {
+                if session.provider != provider {
+                    return Err(io::Error::other("请先关闭当前连接窗口，再切换串流模式。"));
+                }
                 return Ok(Open::Existing {
                     raised: raise_window(session.child.id()),
                 });
@@ -361,27 +785,60 @@ impl Player {
         let dest = self.root.join("backends");
         let archive = self.archive.clone();
         let profile = self.profile.clone();
+        let settings = self.settings.clone();
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(Stop::new()?);
         let signal = Arc::clone(&stop);
         let worker = thread::Builder::new()
             .name("relay-provider".into())
             .spawn(move || {
-                let result = run_script(&dest, archive.as_deref(), None, installer, &tx, &signal)
-                    .and_then(|_| {
-                        let _ = tx.send(InstallEvent::Progress(Progress {
-                            stage: Stage::Profile,
-                            done: 0,
-                            total: 1,
-                        }));
-                        run_script(&dest, None, profile.as_deref(), initializer, &tx, &signal)?
-                            .ok_or_else(|| {
-                                io::Error::other("未获得独立配置程序的校验值；连接窗口未启动。")
-                            })
-                    });
+                let result = run_script(
+                    &dest,
+                    archive.as_deref(),
+                    None,
+                    provider,
+                    model.as_deref(),
+                    None,
+                    installer,
+                    &tx,
+                    &signal,
+                )
+                .and_then(|_| {
+                    if provider == Provider::RelayRender {
+                        run_script(
+                            &dest,
+                            None,
+                            profile.as_deref(),
+                            provider,
+                            None,
+                            None,
+                            RENDER_INSTALL_SCRIPT,
+                            &tx,
+                            &signal,
+                        )?;
+                    }
+                    let _ = tx.send(InstallEvent::Progress(Progress {
+                        stage: Stage::Profile,
+                        done: 0,
+                        total: 1,
+                    }));
+                    run_script(
+                        &dest,
+                        None,
+                        profile.as_deref(),
+                        provider,
+                        model.as_deref(),
+                        settings.as_deref(),
+                        initializer,
+                        &tx,
+                        &signal,
+                    )?
+                    .ok_or_else(|| io::Error::other("未获得独立配置程序的校验值；连接窗口未启动。"))
+                });
                 let _ = tx.send(InstallEvent::Finish(result));
             })?;
         self.preparing = Some(Preparation {
+            provider,
             rx,
             stop,
             worker: Some(worker),
@@ -395,10 +852,26 @@ impl Player {
         installer: &'static str,
         initializer: &'static str,
     ) -> io::Result<Open> {
-        self.begin(installer, initializer)
+        self.begin(Provider::Standard, None, installer, initializer)
+    }
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn begin_stream_fixture(
+        &mut self,
+        installer: &'static str,
+        initializer: &'static str,
+    ) -> io::Result<Open> {
+        self.prepare_only = true;
+        self.begin(Provider::Standard, None, installer, initializer)
+    }
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn use_render_protocol_fixture(&mut self) {
+        self.session.as_mut().expect("launched fixture").provider = Provider::RelayRender;
     }
     pub fn poll(&mut self) -> io::Result<Option<Update>> {
         if let Some(prep) = &self.preparing {
+            let provider = prep.provider;
             let cancelled = prep.stop.requested();
             let mut latest = None;
             loop {
@@ -411,7 +884,12 @@ impl Player {
                         if cancelled {
                             return Ok(Some(Update::Cancelled));
                         }
-                        self.session = Some(self.start_verified(result?)?);
+                        let proof = result?;
+                        if self.prepare_only {
+                            self.prepared = Some((proof, provider));
+                            return Ok(Some(Update::Ready));
+                        }
+                        self.session = Some(self.start_verified(proof, provider)?);
                         return Ok(Some(Update::Opened));
                     }
                     Err(TryRecvError::Empty) => return Ok(latest),
@@ -423,17 +901,37 @@ impl Player {
             }
         }
         if let Some(session) = &mut self.session {
+            if session
+                .closing_since
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(750))
+            {
+                session.shutdown();
+            }
             if let Some(status) = session.child.try_wait()? {
+                session.shutdown();
+                self.last_feedback = session.feedback.lock().unwrap().clone();
                 self.session.take();
                 return Ok(Some(Update::Closed(status)));
             }
         }
         Ok(None)
     }
-    fn start_verified(&self, proof: Proof) -> io::Result<Session> {
+    fn start_verified(&self, proof: Proof, provider: Provider) -> io::Result<Session> {
+        let stream = self.stream_args.len() == 6 && self.stream_args[3] == "stream";
+        let capture = self.stream_args.len() == 2
+            && matches!(
+                self.stream_args[1].to_str(),
+                Some("relay-capture" | "relay-devices")
+            );
+        if !cfg!(test) && !(stream || capture) {
+            return Err(io::Error::other("未选择串流主机；禁止启动后端管理界面。"));
+        }
         // The official executable itself uses a shared QSettings namespace. Only the agreed,
         // isolated launcher produced by verification is eligible here, never a fallback to chiaki.exe.
-        let exe = ordinary(&self.root, &["backends", "chiaki-ng", "relay-profile.exe"])?;
+        let exe = ordinary(
+            &self.root,
+            &["backends", provider.directory(), "relay-profile.exe"],
+        )?;
         // The active image has a single pathname shared by this installation. Holding this deny-write,
         // deny-delete handle across verification and CreateProcess prevents a concurrent initializer
         // from switching the image (and its bound Windows settings namespace) between the two.
@@ -460,15 +958,28 @@ impl Player {
             ));
         }
         let mut cmd = Command::new(&exe);
-        cmd.current_dir(exe.parent().expect("fixed executable has a parent"))
+        cmd.args(&self.stream_args)
+            .current_dir(exe.parent().expect("fixed executable has a parent"))
             .env("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+            // RawInput/XInput expose buttons and sticks but not DualSense motion sensors.
+            // Select SDL's native PS5 HID path before the child initializes its controllers.
+            .env("SDL_JOYSTICK_HIDAPI", "1")
+            .env("SDL_JOYSTICK_HIDAPI_PS5", "1")
+            .env("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1")
+            .env("SDL_JOYSTICK_RAWINPUT", "0")
+            // Keep this local to the stream process; do not change Windows device formats.
+            .env("SDL_AUDIODRIVER", "wasapi")
+            .env("QT_FORCE_STDERR_LOGGING", "1")
+            .env("QT_QUICK_CONTROLS_MATERIAL_ACCENT", "#9aa8ff")
             .creation_flags(CREATE_NO_WINDOW.0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         // Developer shells and other Qt apps can export their own plugin trees. Resolve
         // QML and platform plugins from this standalone player's verified runtime.
         for key in [
+            "QT_QPA_PLATFORM",
+            "QT_DEBUG_PLUGINS",
             "QT_PLUGIN_PATH",
             "QT_QPA_PLATFORM_PLUGIN_PATH",
             "QT_QPA_GENERIC_PLUGINS",
@@ -482,16 +993,183 @@ impl Player {
             ARCHIVE,
             DATA_ROOT,
             CANCEL,
+            NR,
+            MODEL,
+            SETTINGS,
         ] {
             cmd.env_remove(key);
         }
-        let child = cmd.spawn()?;
+        if provider == Provider::RelayRender {
+            let (namespace, _) = crate::connections::identity(self.profile.as_deref());
+            cmd.env("RELAY_RENDER_NAMESPACE", namespace)
+                .env("RELAY_RENDER_PROTOCOL", "1")
+                // The private stdin command applies settings once, after init.
+                .env_remove("RELAY_RENDER_SETTINGS");
+        } else {
+            cmd.env_remove("RELAY_RENDER_NAMESPACE")
+                .env_remove("RELAY_RENDER_PROTOCOL")
+                .env_remove("RELAY_RENDER_SETTINGS");
+        }
+        cmd.env("CHIAKI_VFX_PATH", exe.parent().unwrap().join("vfx"));
+        let job = crate::backend::private_job()?;
+        let mut child = cmd.spawn()?;
+        if let Err(error) = unsafe {
+            AssignProcessToJobObject(HANDLE(job.as_raw_handle()), HANDLE(child.as_raw_handle()))
+        } {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!("无法管理播放组件进程：{error}")));
+        }
+        if provider == Provider::RelayRender {
+            if let Some(input) = child.stdin.as_mut() {
+                writeln!(
+                    input,
+                    "{}",
+                    serde_json::json!({"type":"settings","revision":1,"settings":self.render_settings})
+                )?;
+                input.flush()?;
+            }
+        }
+        let feedback = Arc::new(Mutex::new(serde_json::json!({})));
+        let stats_at = Arc::new(Mutex::new(None));
+        let video_received = Arc::new(AtomicBool::new(false));
+        let mut drainers = Vec::new();
+        if let Some(output) = child.stdout.take() {
+            drainers.push(drain_feedback(
+                output,
+                Arc::clone(&video_received),
+                Arc::clone(&feedback),
+                Arc::clone(&stats_at),
+            ));
+        }
+        if let Some(output) = child.stderr.take() {
+            drainers.push(drain_feedback(
+                output,
+                Arc::clone(&video_received),
+                Arc::clone(&feedback),
+                Arc::clone(&stats_at),
+            ));
+        }
         Ok(Session {
+            provider,
             child,
+            job: Some(job),
             _image_lock: image,
+            video_received,
+            feedback,
+            stats_at,
+            closing_since: None,
+            revision: 1,
+            drainers,
         })
     }
-    // Closing Relay only closes the tracking handles; a running player's session continues.
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+mod feedback_tests {
+    use super::*;
+    #[test]
+    fn session_exit_reason_is_retained_without_claiming_video_was_received() {
+        let feedback = Arc::new(Mutex::new(serde_json::json!({})));
+        let received = Arc::new(AtomicBool::new(false));
+        let event = serde_json::json!({"type":"sessionEnded","error":true,"reasonCode":8,"reason":"Control connection failed"});
+        drain_feedback(
+            io::Cursor::new(format!("RELAY_RENDER {event}\n").into_bytes()),
+            Arc::clone(&received),
+            Arc::clone(&feedback),
+            Arc::new(Mutex::new(None)),
+        )
+        .join()
+        .unwrap();
+        let state = feedback.lock().unwrap();
+        assert_eq!(state["sessionEnded"]["reasonCode"], 8);
+        assert!(state["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Control connection failed"));
+        assert!(!received.load(Ordering::Acquire));
+    }
+    #[test]
+    fn diagnostic_samples_expire_and_are_invalid_while_stopping() {
+        assert!(stats_fresh(Some(Instant::now()), false));
+        assert!(!stats_fresh(None, false));
+        assert!(!stats_fresh(
+            Some(Instant::now() - Duration::from_secs(5)),
+            false
+        ));
+        assert!(!stats_fresh(Some(Instant::now()), true));
+    }
+    #[test]
+    fn renderer_reports_reach_host_with_actual_units_and_backend_names() {
+        let feedback = Arc::new(Mutex::new(serde_json::json!({})));
+        let at = Arc::new(Mutex::new(None));
+        let received = Arc::new(AtomicBool::new(false));
+        let line = serde_json::json!({"type":"stats","width":1920,"height":1080,
+            "bitrateMbps":83.75,"displayFps":117.42,"frameGeneration":"5",
+            "frameGenerationMultiplier":2,"pictureSource":"stream",
+            "gpu":{"adapterName":"Test GPU","driverVersion":"test-driver",
+                "dlssNrReported":true,"dlssNrSupported":false,"nrProbeState":"failed"}});
+        let input = io::Cursor::new(format!("RELAY_RENDER {line}\n").into_bytes());
+        drain_feedback(
+            input,
+            Arc::clone(&received),
+            Arc::clone(&feedback),
+            Arc::clone(&at),
+        )
+        .join()
+        .unwrap();
+        let report = feedback.lock().unwrap();
+        let stats = &report["stats"];
+        assert!(received.load(Ordering::Acquire) && at.lock().unwrap().is_some());
+        assert_eq!(stats["bitrateKbps"], 83750.);
+        assert_eq!(stats["outputFps"], 117.42);
+        assert_eq!(stats["frameGeneration"], "dlssg-dx12");
+        assert_eq!(stats["gpu"]["dlssNrSupported"], false);
+        assert_eq!(stats["gpu"]["dlssNrReported"], true);
+        assert_eq!(stats["pictureSource"], "stream");
+        let only_targets =
+            normalize_stats(serde_json::json!({"targetBitrateKbps":200000,"targetFps":240}));
+        assert!(only_targets["bitrateKbps"].is_null() && only_targets["outputFps"].is_null());
+    }
+    #[test]
+    fn native_pin_requests_are_delivered_to_player_controls() {
+        let feedback = Arc::new(Mutex::new(serde_json::json!({})));
+        let at = Arc::new(Mutex::new(None));
+        let received = Arc::new(AtomicBool::new(false));
+        for required in [true, false, true] {
+            let line = serde_json::json!({"type":"pinRequired","required":required});
+            drain_feedback(
+                io::Cursor::new(format!("RELAY_RENDER {line}\n").into_bytes()),
+                Arc::clone(&received),
+                Arc::clone(&feedback),
+                Arc::clone(&at),
+            )
+            .join()
+            .unwrap();
+            assert_eq!(
+                feedback.lock().unwrap()["pinRequired"]["required"],
+                required
+            );
+            assert!(!received.load(Ordering::Acquire));
+        }
+    }
+    #[test]
+    fn only_actual_video_packet_report_enables_playing_state() {
+        assert!(video_packet_report(
+            "[I] Switched to profile 0, resolution: 1920x1080\r\n"
+        ));
+        for line in [
+            "Connected",
+            "Video Profiles:",
+            "  0: 1920x1080",
+            "NR enabled",
+            "Switched to profile 0, resolution: 0x1080",
+            "Switched to profile 0, resolution: 1920x1080; injected",
+        ] {
+            assert!(!video_packet_report(line));
+        }
+    }
 }
 
 struct WindowSearch {

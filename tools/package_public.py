@@ -1,4 +1,4 @@
-"""Package the PS5-ready public RelayPlayer release from v0.1.8. Python 3.11+ and Git.
+"""Package the PS5-ready public RelayPlayer release from v0.1.14. Python 3.11+ and Git.
 
 Build RelayPlayer.exe from that tag first. This tool checks its format and
 public interface markers; it does not prove binary build provenance. Source and
@@ -18,14 +18,16 @@ import tempfile
 import tomllib
 import zipfile
 
-VERSION = "0.1.8"
+VERSION = "0.1.14"
 TAG = "v" + VERSION
 HOST = f"RelayPlayer-{VERSION}-windows-x64.zip"
 SOURCE = f"RelayPlayer-{VERSION}-public-source.zip"
 SUMS = "SHA256SUMS.txt"
-DOCS = ("README.md", "docs/BACKEND.md", "docs/CHIAKI-PROFILE.md", "docs/releases/v0.1.8.md",
-        "notices/CHIAKI-NG.md", "notices/RUST-THIRD-PARTY.txt", "notices/RUST-STANDARD-LIBRARY.html")
-SCRIPTS = ("tools/ensure-chiaki.ps1", "tools/Initialize-ChiakiProfile.ps1")
+DOCS = ("LICENSE", "README.md", "vendor/relay-protocol/LICENSE", "vendor/relay-protocol/README.md", "vendor/relay-protocol/AGPL-3.0-only-OpenSSL.txt", "docs/BACKEND.md", "docs/CHIAKI-PROFILE.md", "docs/patches/dualsense-motion.patch", "docs/releases/v0.1.10.md", "docs/releases/v0.1.9.md", "docs/patches/relay-render/README.md", "docs/patches/relay-render/relay-render.patch", "vendor/artcnn/LICENSE", "vendor/artcnn/README.md",
+        "docs/releases/v0.1.11.md", "docs/releases/v0.1.12.md", "docs/releases/v0.1.13.md", "docs/releases/v0.1.14.md", "notices/CHIAKI-NR.md", "notices/CHIAKI-NG.md", "notices/RUST-THIRD-PARTY.txt", "notices/RUST-STANDARD-LIBRARY.html")
+SCRIPTS = ("tools/ensure-chiaki.ps1", "tools/Initialize-ChiakiProfile.ps1", "tools/ensure-relay-render.ps1")
+RENDER_SOURCE = ("tools/relay-render-manifest.json", "vendor/artcnn/ArtCNN_C4F16.glsl", "vendor/artcnn/ArtCNN_C4F16_DN.glsl",
+    *("docs/patches/relay-render/"+n for n in ("gui/include/relaycontrol.h","gui/src/relaycontrol.cpp","gui/include/relaycapture.h","gui/src/relaycapture.cpp","gui/include/relayfilters.h","gui/include/relaytelemetry.h","gui/include/relaypolicy.h","gui/src/qml/RelayView.qml")))
 # These three binary inputs are the reviewed output of tools/make_icon.py.
 ICONS = {
     "assets/relay.ico": "70367948c24a0564c3d74ad35ffbbcb49bc789bbdd93f2a2f8461108af7db4f3",
@@ -33,11 +35,13 @@ ICONS = {
     "assets/icon.rgba": "75a7127c1a1890c6d28943d3be15ba5fd163815239c5add47a9fecf892c736d7",
 }
 FILES = frozenset((".gitattributes", ".gitignore", "Cargo.toml", "Cargo.lock", "build.rs",
+                   "vendor/relay-protocol/Cargo.toml", "vendor/relay-protocol/Cargo.lock",
+                   *("vendor/relay-protocol/src/" + s + ".rs" for s in ("lib", "base64", "discovery", "error", "http", "random", "regist", "rpcrypt", "rpcrypt/rpcrypt_tables", "sock", "stoppipe", "time")),
                    "tools/make_icon.py", "tools/package_public.py", "tests/test_chiaki_profile.py",
-                   "docs/releases/v0.1.7.md", *DOCS, *SCRIPTS, *ICONS,
-                   *("src/" + s + ".rs" for s in ("backend", "backend_protocol_test", "chiaki", "chiaki_ui", "design", "main", "migration",
+                   "docs/releases/v0.1.7.md", "docs/releases/v0.1.8.md", *DOCS, *SCRIPTS, *RENDER_SOURCE, *ICONS,
+                   *("src/" + s + ".rs" for s in ("backend", "backend_protocol_test", "playback", "chiaki", "chiaki_ui", "connections", "design", "main", "migration",
                      "migration_settings_tests", "panels", "platform", "platform_tests"))))
-DIRS = {p.rsplit("/", 1)[0] for p in FILES if "/" in p}
+DIRS = {"/".join(p.split("/")[:i]) for p in FILES for i in range(1,len(p.split("/")))}
 OID = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 MIB = 1024 * 1024
 
@@ -166,7 +170,9 @@ def check_exe(data):
         runnable |= size > 0 and data[pos:pos+8].rstrip(b"\0") == b".text" and bool(data[pos+39] & 0x20)
     require(runnable and not any(data[last:]), "expected a code section and no appended payload")
     for marker in ("relay-backend.exe", "RELAY_HOST_PID", "relay-profile.exe",
-                   "6ca3f5e6780608104d79345ab7755cfa77fefc33a41ae10651a874c43f54ea57"):
+                   "6ca3f5e6780608104d79345ab7755cfa77fefc33a41ae10651a874c43f54ea57",
+                   "b07e58000ebf38545518c955ad9462ad8fac30dc8e0438ff44d5119d93c91ebe",
+                   "SDL_AUDIODRIVER"):
         require(marker.encode() in data or marker.encode("utf-16le") in data,
                 "executable is missing a required public backend or official archive marker")
     scan_values(data, "RelayPlayer.exe")
@@ -198,7 +204,7 @@ def make_zip(path, files):
                     and z.read(item) == files[item.filename], "ZIP content failed readback: " + item.filename)
 
 
-def assemble(exe, out):
+def assemble(exe, out, native_overlay):
     require(exe.name.casefold() == "relayplayer.exe", "supply the freshly built RelayPlayer.exe explicitly")
     check_path(exe)
     check_path(out)
@@ -208,6 +214,18 @@ def assemble(exe, out):
     source = tagged_source(Path(__file__).resolve().parents[1])
     binary = exe.read_bytes()
     check_exe(binary)
+    require(native_overlay is not None and native_overlay.is_file(), "supply the pinned native overlay with --native-overlay")
+    overlay = native_overlay.read_bytes()
+    pinned_script = source["tools/ensure-relay-render.ps1"].decode("utf-8-sig")
+    require(len(overlay) < 64*MIB and hashlib.sha256(overlay).hexdigest() in pinned_script, "native overlay SHA-256 differs from the tagged installer")
+    import json
+    manifest = json.loads(source["tools/relay-render-manifest.json"])
+    with zipfile.ZipFile(native_overlay) as z:
+        require(len(set(z.namelist()))==len(z.namelist()), "duplicate overlay entries")
+        for item in z.infolist():
+            require(item.filename in manifest and not item.filename.startswith("vfx/") and item.filename!="nvngx_dlssnr.dll", "unexpected or proprietary runtime asset in overlay")
+            expected=manifest[item.filename]
+            require(item.file_size==expected["size"] and hashlib.sha256(z.read(item)).hexdigest()==expected["sha256"], "overlay entry differs from tagged manifest")
     for name in SCRIPTS:
         payload = source[name].replace(b"\r\n", b"\n")
         require(payload in binary or payload.replace(b"\n", b"\r\n") in binary,
@@ -216,7 +234,7 @@ def assemble(exe, out):
     with tempfile.TemporaryDirectory(prefix=".public-", dir=out) as t:
         stage = Path(t)
         make_zip(stage/SOURCE, source)
-        make_zip(stage/HOST, {"RelayPlayer.exe": binary, **{n: source[n] for n in (*DOCS, *SCRIPTS)}})
+        make_zip(stage/HOST, {"RelayPlayer.exe": binary, "runtime/relay-render-overlay.zip":overlay, "tools/relay-render-manifest.json":source["tools/relay-render-manifest.json"], **{n: source[n] for n in (*DOCS, *SCRIPTS)}})
         digests = {n: hashlib.sha256((stage/n).read_bytes()).hexdigest() for n in (HOST, SOURCE)}
         (stage/SUMS).write_bytes("".join(f"{h}  {n}\n" for n, h in digests.items()).encode("ascii"))
         created = []
@@ -235,11 +253,12 @@ def assemble(exe, out):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", required=True, type=Path, help="new RelayPlayer.exe built from v0.1.8")
+    parser.add_argument("--exe", required=True, type=Path, help="new RelayPlayer.exe built from v0.1.14")
     parser.add_argument("--out-dir", required=True, type=Path, help="new or empty release output directory")
+    parser.add_argument("--native-overlay",type=Path,required=True,help="verified native renderer overlay")
     args = parser.parse_args()
     try:
-        assemble(Path(os.path.abspath(args.exe)), Path(os.path.abspath(args.out_dir)))
+        assemble(Path(os.path.abspath(args.exe)), Path(os.path.abspath(args.out_dir)), args.native_overlay)
     except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
         print(f"Packaging stopped: {e}", file=sys.stderr)
         raise SystemExit(1)

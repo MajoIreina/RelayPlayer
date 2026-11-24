@@ -1,50 +1,49 @@
 # RelayPlayer
 
-Windows 上的 PS5 遥控游玩播放器。**没有采集卡也能用**：电脑和 PS5 通过网络连接，串流由开源项目 [chiaki-ng](https://github.com/chiaki-ng/chiaki-ng) 提供。
+Windows 上的 PS5 遥控游玩播放器。没有采集卡也能通过网络游玩。界面沿用 0.1.6：顶部连接、采集、画质、手柄、状态面板，中央画面，底部音量、NR 和全屏。全屏只显示画面。
 
-**[下载 Windows x64 版](https://github.com/MajoIreina/RelayPlayer/releases/download/v0.1.8/RelayPlayer-0.1.8-windows-x64.zip)** · [版本说明与 SHA-256](https://github.com/MajoIreina/RelayPlayer/releases/tag/v0.1.8)
+[下载 0.1.14](https://github.com/MajoIreina/RelayPlayer/releases/tag/v0.1.14)。已验证 PS5 1080p、约 60 fps 连续串流和停止；GT7 体感实玩与主观音质听测仍需后续验证。
 
-## 第一次连 PS5
+## 连接 PS5
 
-1. 将整个 ZIP 解压到自己的可写文件夹，例如 `D:\Apps\RelayPlayer`。打开 `RelayPlayer.exe`，点 **配对 / 连接 PS5**。首次会从 chiaki-ng 的 GitHub 发布页自动下载并校验约 **113 MiB** 的组件，然后打开连接窗口。无需单独安装后端、Rust 或 Python；之后在这个目录启动会复用组件。首次准备时请在解压盘预留约 500 MiB。
-2. 让电脑和 PS5 连到同一局域网，在 PS5 上打开 **设定 → 系统 → 远程游玩 → 启动远程游玩**。在连接窗口选中自己的 PS5。若列表里没有主机，可在该窗口按 **F2** 手动输入 PS5 的局域网 IP；也可从 **Settings → Consoles → Register New** 打开注册表单。
-3. 首次配对按连接窗口提示操作。已通过自己 PSN 登录且支持自动注册时，可选自动注册；如采用配对码，先选 PS5，再到主机的 **设定 → 系统 → 远程游玩 → 配对设备** 获取屏幕上的码。手动配对还需要该用户的 **PSN Account ID**；连接窗口可以协助获取，它不是公开昵称。配对成功后选中已注册的主机即可播放，下次不必重复输入配对码。
+1. 解压至可写目录，运行 `RelayPlayer.exe`，打开顶部「连接」。电脑和 PS5 连接同一局域网，在 PS5 的设定 → 系统 → 远程游玩中启用远程游玩。
+2. 点击「搜索局域网主机」，选择主机；搜索不到时填写主机 IP。首次配对在 PS5 上选择关联设备，输入当次显示的 8 位配对码。
+3. 在原来的连接面板点击「在浏览器登录 Sony」，使用主机上同一账号登录，粘贴浏览器最终的完整 Remote Play 回跳网址并完成授权。账号 ID 自动读取，无需自己查询；已配对主机以后无需重复登录。
+4. 点击「配对主机」，再从已配对主机中点击「开始串流」。首次自动准备、校验组件，之后复用。发现、授权、配对和选择主机全部由 Relay 界面完成；后端仅以指定主机的直接串流方式启动，不打开其管理首页。以后点击左下播放按钮可直接连接最近成功使用的主机；停止连接不再弹确认框。
 
-首次下载中断可在同一入口重试；若已安装的组件损坏，播放器会先验证新副本，再保留旧目录备份并切换。如果网络无法访问 GitHub，也可预先从[上游 v1.10.1](https://github.com/chiaki-ng/chiaki-ng/releases/tag/v1.10.1) 下载 `chiaki-ng-win_x64-MSYS2-portable-1.10.1.zip`，**不用解压**，执行 `RelayPlayer.exe --connect --backend-archive <压缩包路径>`。离线导入和在线下载使用相同的校验。
+默认使用固定社区运行时和本项目的渲染适配组件，按完整文件清单校验，见 [构建与来源](docs/patches/relay-render/README.md)。首次准备需要网络，并在解压目录存放组件，建议预留 3 GiB。`--connect` 仅打开原连接面板并搜索，不自动连接未经选择的主机。
 
 ## 播放与设置
 
-默认在 chiaki-ng 的独立窗口配对和播放，该窗口负责视频、音频、手柄、全屏和串流画质。请在播放窗口修改码率、分辨率等设置。局域网内再次使用已有配对时，RelayPlayer 不需要重新从 GitHub 下载组件。
+中央默认嵌入串流画面，也保留原来的独立窗口选项。音量仅作用于当前串流进程。顶部在播放时可自动隐藏，F11 全屏、Esc 返回；全屏隐藏顶部、底部、通知与侧面设置。
 
-另有[可选的 IPC 后端接口](docs/BACKEND.md)，用于提供嵌入式播放、采集卡或画质处理的后端。默认网络后端不提供宿主的 DLSS5 NR 开关、嵌入画面或 200 Mbps 锁定；公开版没有随附采集卡后端。
+在「画质」调整分辨率、帧率、目标码率（Mbps 滑条，最高 200 Mbps）、编码；底栏与画质面板共享 NR 开关。渲染设置通过私有通道应用，串流参数等需重连的项目在画质页与状态页明确显示。目标码率不等于实测吞吐，200 Mbps 属于实验性请求。算法与滤镜是否生效以实际渲染反馈为准，不将回退算法标记为已选算法。
 
-## 个人配对数据
+启用 NR 后，下次连接自动准备固定社区运行时与模型，首次共约 443 MiB，建议预留 1.5 GiB；可取消或重新校验。需要兼容的 RTX 显卡与驱动。默认在输入分辨率单次处理，实际帧效果未确认时不显示“生效”。模型为专有社区组件，见 [NR 来源与限制](notices/CHIAKI-NR.md)。
 
-发行包不包含账号、已配对主机、密钥或本地配置；它们由每位用户在首次使用时创建。网络后端的配对记录保存在当前 Windows 用户专属的 RelayPlayer 注册表配置中，同一用户升级可继续使用。它与单独安装的 Chiaki、旧 IPC 后端的配对数据分开；用 `RELAY_PLAYER_ROOT` 可再隔离一个测试配置。旧版配置无需删除。请勿分享自己已经运行过的播放器目录、注册表导出或 PSN 登录回调地址。
+USB DualSense 使用原生 HID、后台输入与姿态修正。音频使用 WASAPI 并保留缓冲修正。采集、画质与滤镜统一接入播放器自己的设置；未测量或不可用的项目明确显示状态。采集卡实机、GT7 体感与主观音质仍需验证，PSN 异地穿透尚未接入。
 
-旧 IPC 用户仍可显式运行 `RelayPlayer.exe --ipc-backend`。需要本机旧授权时可运行 `RelayPlayer.exe --import-legacy`：仅补齐缺少的文件，设置优先沿用 0.1.5，授权依次查找 0.1.5、0.1.4、0.1.3；启用 `RELAY_PLAYER_ROOT` 的隔离实例禁止旧数据导入。旧授权不能代替 chiaki-ng 的首次配对。
+## 授权与设置
 
-## 从源码构建
+同一 Windows 用户继续读取此前公开版的 Relay 专属配对配置，普通与 NR 模式共用。新连接模块将配对记录保存在当前用户 DPAPI 加密的 `data/public-connections.bin`，仅向已绑定的本机后端配置同步选定主机。显示名称与配对密钥保留；运行时内部使用唯一别名避免两台同名 PS5 连接混淆。有效旧画质设置会先从本项目命名空间读取，再由已保存的 Relay 设置覆盖。
 
-需要 Windows x64、Rust MSVC 工具链、Visual Studio C++ 构建工具和 Windows SDK。在仓库根目录执行：
+发行文件不包含个人数据、密钥或回跳网址。`RELAY_PLAYER_ROOT` 可指定独立测试数据目录，同时派生隔离的后端配置。请勿分享自己运行过的 data 文件夹或注册表导出。存储损坏时停止修改并保留原文件。
+
+旧 IPC 后端可显式使用 `--ipc-backend`；`--import-legacy` 仅在该模式补齐旧文件：设置沿用 0.1.5，授权按 0.1.5、0.1.4、0.1.3 顺序查找。旧 IPC 授权不能转换成公开后端的配对密钥。[IPC 接口说明](docs/BACKEND.md)。
+
+## 源码与许可
+
+宿主及内置连接协议按 GNU AGPL v3 发布，见 [LICENSE](LICENSE)。局域网发现、注册与加密代码取自固定提交的 chiaki-rust 子集，保留完整源码与署名，见 [协议来源](vendor/relay-protocol/README.md)。视频后端与模型独立按需取得，实际来源分别见 [chiaki-ng](notices/CHIAKI-NG.md)、[NR](notices/CHIAKI-NR.md)；第三方组件不统一改写许可或作者。
+
+Windows x64 构建需要 Rust MSVC、Visual Studio C++ 工具及 Windows SDK：
 
 ```powershell
-cargo test --locked --release --target x86_64-pc-windows-msvc
-cargo build --locked --release --target x86_64-pc-windows-msvc
+cargo test --locked
+cargo test --locked --manifest-path vendor/relay-protocol/Cargo.toml
+cargo build --locked --release
 ```
 
-生成 `target/x86_64-pc-windows-msvc/release/RelayPlayer.exe`。宿主使用 egui/eframe 和 windows-rs；见 [Cargo.lock](Cargo.lock)、[Rust 依赖与字体声明](notices/RUST-THIRD-PARTY.txt)、[Rust 标准库声明](notices/RUST-STANDARD-LIBRARY.html) 和 [chiaki-ng 来源与校验](notices/CHIAKI-NG.md)。
+生成 `target/release/RelayPlayer.exe`。发布构建应通过 `--remap-path-prefix` 映射用户目录与工作目录。`tools/package_public.py` 只从相同版本标签的精确白名单打包源码、程序、说明及许可，不收集 data 或本地运行时。依赖声明见 [Rust 第三方声明](notices/RUST-THIRD-PARTY.txt)。
 
-复核发行包时，先检出 `v0.1.8` 标签，再用 Git、Python 3.11+ 打包到空目录。为避免将开发机的个人路径嵌入发行程序，请映射构建路径；若自定义了 `CARGO_HOME`，也请对其做同类映射。
 
-```powershell
-$env:CARGO_ENCODED_RUSTFLAGS = @(
-    "--remap-path-prefix=$env:USERPROFILE=/rust-home",
-    "--remap-path-prefix=$($PWD.Path)=/relayplayer",
-    '-C', 'link-arg=/PDBALTPATH:%_PDB%'
-) -join [char]31
-cargo build --locked --release --target x86_64-pc-windows-msvc
-python tools/package_public.py --exe target/x86_64-pc-windows-msvc/release/RelayPlayer.exe --out-dir ../relay-release
-```
-
-打包工具只读取标签白名单中的 Git 文件和显式指定的 EXE，并逐个读回 ZIP 成员核对字节。[v0.1.7](docs/releases/v0.1.7.md) 保留为首个公开版本。
+0.1.14 调整视频窗口交接与画质初始化时序，移除白色原生标题栏，并新增左下角一键连接最近成功使用的主机。保留 0.1.6 布局及此前的手柄、音频、画质、倍率和退出清理修复。变更与验证范围见 [0.1.14 说明](docs/releases/v0.1.14.md)。

@@ -1,0 +1,28 @@
+# Source-equivalent local correction for the pinned chiaki-ng builds.
+# Original files: LicenseRef-AGPL-3.0-only-OpenSSL.
+# References: chiaki-ng issue #777 and the motion portion of unmerged PR #805.
+# This applies to SDL motion controllers; no packet format or credentials change.
+# The reviewed executable representations are generated locally by
+# tools/Initialize-ChiakiProfile.ps1. Neither executable is redistributed.
+--- a/lib/src/orientation.c
++++ b/lib/src/orientation.c
+@@ -12,7 +12,7 @@
+ #define BETA_WARMUP 20.0f
+ #define BETA_DEFAULT 0.05f
+ 
+-#define ORIENT_FUZZ 0.0007f
++#define ORIENT_FUZZ 0.0f
+ #define FUZZ_FILTER_PREV_WEIGHT 0.75f
+ #define FUZZ_FILTER_PREV_WEIGHT2x 0.6f
+ 
+--- a/gui/src/controllermanager.cpp
++++ b/gui/src/controllermanager.cpp
+@@ -619,7 +619,7 @@
+ 			accel_x, accel_y, accel_z, true);
+ 			chiaki_orientation_tracker_update(
+ 				&orientation_tracker, state.gyro_x, state.gyro_y, state.gyro_z,
+-				accel_x, accel_y, accel_z, &accel_zero, false, event.timestamp * 1000);
++				accel_x, accel_y, accel_z, &accel_zero, true, event.timestamp * 1000);
+ 			break;
+ 		case SDL_SENSOR_GYRO:
+ 			gyro_x = event.data[0];

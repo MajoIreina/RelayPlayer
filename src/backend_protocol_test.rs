@@ -1,26 +1,111 @@
 //! Runs a disposable backend using this test executable. No installed backend,
-//! console, network, device or existing user data is required.
+#[allow(dead_code)]
+#[path = "playback.rs"]
+mod playback;
+// console, network, device or existing user data is required.
 #[path = "backend.rs"]
 mod backend;
 #[allow(dead_code)]
 #[path = "chiaki.rs"]
 mod chiaki;
+#[allow(dead_code)]
+#[path = "connections.rs"]
+mod connections;
 
 use backend::{Backend, BackendEvent};
 use serde_json::{json, Value};
 use std::{
     env, fs,
     io::{self, BufRead, Write},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::{
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use windows::Win32::{
-    Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
-    System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+use windows::{
+    core::w,
+    Win32::{
+        Foundation::{HANDLE, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{
+            OpenProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_SYNCHRONIZE,
+        },
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, IsWindow, PeekMessageW, MSG,
+            PM_REMOVE, WS_CHILD, WS_EX_NOPARENTNOTIFY, WS_POPUP,
+        },
+    },
 };
+
+struct TestChild(Child);
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+struct TestWindow(HWND);
+impl Drop for TestWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+fn hidden_window(parent: HWND) -> TestWindow {
+    TestWindow(unsafe {
+        CreateWindowExW(
+            WS_EX_NOPARENTNOTIFY,
+            w!("STATIC"),
+            w!("Relay lifecycle fixture"),
+            if parent.is_invalid() {
+                WS_POPUP
+            } else {
+                WS_CHILD
+            },
+            0,
+            0,
+            16,
+            16,
+            parent,
+            None,
+            None,
+            None,
+        )
+        .expect("hidden test window")
+    })
+}
+fn assert_exited(handle: &OwnedHandle) {
+    assert_eq!(
+        unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 5000) },
+        WAIT_OBJECT_0
+    );
+}
+fn await_pid(path: &Path) -> u32 {
+    let end = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(pid) = fs::read_to_string(path)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(Instant::now() < end, "fixture did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+fn fixture_host(root: PathBuf, profile: PathBuf, archive: PathBuf) -> io::Result<()> {
+    let mut player = chiaki::Player::new(root, Some(profile), Some(archive));
+    player.begin_stream_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
+    assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Ready));
+    player.launch_stream("测试 PS5 '$&", "127.0.0.1")?;
+    loop {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
 
 fn fixture() -> io::Result<()> {
     let exe = env::current_exe()?;
@@ -143,6 +228,21 @@ fn run_contract() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::args().nth(1).as_deref() == Some("--fixture-wait") {
+        thread::sleep(Duration::from_secs(45));
+        return Ok(());
+    }
+    if env::args().nth(1).as_deref() == Some("--fixture-owned-host") {
+        let args: Vec<_> = env::args_os().skip(2).map(PathBuf::from).collect();
+        fixture_host(args[0].clone(), args[1].clone(), args[2].clone())?;
+        return Ok(());
+    }
+    if env::args().nth(1).as_deref() == Some("--native-pair-fixture") {
+        connections::write_native_fixture(Path::new(
+            &env::args_os().nth(2).ok_or("missing fixture profile")?,
+        ))?;
+        return Ok(());
+    }
     if env::current_exe()?.file_name() == Path::new("relay-backend.exe").file_name() {
         if env::args().nth(1).as_deref() == Some("--fixture-wait") {
             thread::sleep(Duration::from_secs(30));
@@ -190,11 +290,40 @@ const FAIL_INSTALL: &str = r#"param([string]$InstallRoot,[string]$ArchivePath)
 fn gui_fixture() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     assert_eq!(env::current_exe()?, cwd.join("relay-profile.exe"));
-    assert_eq!(env::args_os().count(), 1);
+    if env::args_os().count() != 1 {
+        assert_eq!(
+            env::args().skip(1).collect::<Vec<_>>(),
+            [
+                "--dualsense",
+                "--exit-app-on-stream-exit",
+                "--",
+                "stream",
+                "测试 PS5 '$&",
+                "127.0.0.1"
+            ]
+        );
+        println!("[I] Switched to profile 0, resolution: 1920x1080");
+        println!(
+            "RELAY_RENDER {}",
+            json!({"type":"stats","width":1920,"height":1080,
+            "bitrateMbps":83.75,"displayFps":117.42,"frameGeneration":"5","frameGenerationMultiplier":2,
+            "pictureSource":"stream","gpu":{"adapterName":"Fixture GPU","driverVersion":"fixture-driver"}})
+        );
+        io::stdout().flush()?;
+    }
     assert_eq!(
         env::var("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS").as_deref(),
         Ok("1")
     );
+    for (name, value) in [
+        ("SDL_JOYSTICK_HIDAPI", "1"),
+        ("SDL_JOYSTICK_HIDAPI_PS5", "1"),
+        ("SDL_JOYSTICK_HIDAPI_PS5_RUMBLE", "1"),
+        ("SDL_JOYSTICK_RAWINPUT", "0"),
+        ("SDL_AUDIODRIVER", "wasapi"),
+    ] {
+        assert_eq!(env::var(name).as_deref(), Ok(value));
+    }
     for name in [
         "RELAY_ROOT",
         "RELAY_DATA",
@@ -203,6 +332,39 @@ fn gui_fixture() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         assert!(env::var_os(name).is_none());
     }
+    // Keep inherited output handles open, even if the renderer exits first.
+    // The owner must end the whole private job before joining its pipe readers.
+    let helper = Command::new(env::current_exe()?)
+        .arg("--fixture-wait")
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    fs::write(cwd.join("fixture-helper"), helper.id().to_string())?;
+    let mode = fs::read_to_string(cwd.join("fixture-mode")).unwrap_or_default();
+    if mode == "protocol" {
+        let stop_marker = cwd.join("fixture-stop");
+        thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                if let Ok(line) = line {
+                    if serde_json::from_str::<Value>(&line).is_ok_and(|v| v["type"] == "stop") {
+                        fs::write(&stop_marker, b"direct-stop-no-sleep").unwrap();
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    let window = if mode == "window" {
+        let parent = fs::read_to_string(cwd.join("fixture-parent"))
+            .ok()
+            .and_then(|v| v.parse::<isize>().ok())
+            .unwrap_or(0);
+        Some(hidden_window(HWND(parent as _)))
+    } else {
+        None
+    };
     let mut marker = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -211,6 +373,21 @@ fn gui_fixture() -> Result<(), Box<dyn std::error::Error>> {
     let stop = cwd.join("fixture-exit");
     let until = Instant::now() + Duration::from_secs(10);
     while !stop.is_file() && Instant::now() < until {
+        if mode == "protocol" && cwd.join("fixture-stop").is_file() {
+            return Ok(());
+        }
+        if let Some(window) = &window {
+            let mut msg = MSG::default();
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+                if !IsWindow(window.0).as_bool() {
+                    fs::write(cwd.join("fixture-graceful"), b"WM_CLOSE")?;
+                    return Ok(());
+                }
+            }
+        }
         thread::sleep(Duration::from_millis(10));
     }
     assert!(stop.is_file());
@@ -304,11 +481,13 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(dir.join("fixture-exit"), b"stop")?;
     assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Closed(s) if s.success()));
     assert!(!player.running() && !root.join("data").exists());
-    // Closing the launcher must not disconnect a live session in the player's own window.
+    // Closing the host must stop its renderer and helpers, including when no window exists.
     fs::remove_file(dir.join("fixture-exit"))?;
     fs::remove_file(dir.join("fixture-started"))?;
-    player.begin_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
-    assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Opened));
+    player.begin_stream_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
+    assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Ready));
+    assert!(!player.running() && !dir.join("fixture-started").exists());
+    player.launch_stream("测试 PS5 '$&", "127.0.0.1")?;
     let end = Instant::now() + Duration::from_secs(5);
     let pid = loop {
         if let Some(pid) = fs::read_to_string(dir.join("fixture-started"))
@@ -321,16 +500,136 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(10));
     };
     let handle = process_handle(pid);
-    drop(player);
+    let helper = process_handle(await_pid(&dir.join("fixture-helper")));
+    let unrelated = TestChild(
+        Command::new(env::current_exe()?)
+            .arg("--fixture-wait")
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let until = Instant::now() + Duration::from_secs(3);
+    while !player.video_received() {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let feedback_until = Instant::now() + Duration::from_secs(3);
+    while player.render_feedback()["stats"]["gpu"]["adapterName"] != "Fixture GPU" {
+        assert!(Instant::now() < feedback_until);
+        thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
-        unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 50) },
+        player.render_feedback()["stats"]["frameGeneration"],
+        "dlssg-dx12"
+    );
+    assert_eq!(player.render_feedback()["stats"]["bitrateKbps"], 83750.);
+    let shutdown_at = Instant::now();
+    drop(player);
+    assert!(shutdown_at.elapsed() < Duration::from_secs(4));
+    assert_exited(&handle);
+    assert_exited(&helper);
+    assert_eq!(
+        unsafe { WaitForSingleObject(HANDLE(unrelated.0.as_raw_handle()), 0) },
         WAIT_TIMEOUT
     );
-    fs::write(dir.join("fixture-exit"), b"stop")?;
-    assert_eq!(
-        unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 5000) },
-        WAIT_OBJECT_0
+    for embedded in [false, true] {
+        for name in ["fixture-started", "fixture-helper", "fixture-graceful"] {
+            let _ = fs::remove_file(dir.join(name));
+        }
+        fs::write(dir.join("fixture-mode"), b"window")?;
+        let host = hidden_window(HWND::default());
+        fs::write(
+            dir.join("fixture-parent"),
+            if embedded {
+                (host.0 .0 as isize).to_string()
+            } else {
+                "0".into()
+            },
+        )?;
+        let mut player =
+            chiaki::Player::new(root.clone(), Some(profile.clone()), Some(zip.clone()));
+        player.begin_stream_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
+        assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Ready));
+        player.launch_stream("测试 PS5 '$&", "127.0.0.1")?;
+        let renderer = process_handle(await_pid(&dir.join("fixture-started")));
+        let helper = process_handle(await_pid(&dir.join("fixture-helper")));
+        player.shutdown();
+        player.shutdown(); // Explicit exit followed by Drop is harmless.
+        assert!(!player.running());
+        assert_exited(&renderer);
+        assert_exited(&helper);
+        assert_eq!(fs::read(dir.join("fixture-graceful"))?, b"WM_CLOSE");
+    }
+    for name in [
+        "fixture-started",
+        "fixture-helper",
+        "fixture-mode",
+        "fixture-parent",
+    ] {
+        let _ = fs::remove_file(dir.join(name));
+    }
+    for mode in ["protocol", "unresponsive"] {
+        for name in ["fixture-started", "fixture-helper", "fixture-stop"] {
+            let _ = fs::remove_file(dir.join(name));
+        }
+        fs::write(dir.join("fixture-mode"), mode)?;
+        let mut player =
+            chiaki::Player::new(root.clone(), Some(profile.clone()), Some(zip.clone()));
+        player.begin_stream_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
+        assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Ready));
+        player.launch_stream("测试 PS5 '$&", "127.0.0.1")?;
+        let renderer = process_handle(await_pid(&dir.join("fixture-started")));
+        let helper = process_handle(await_pid(&dir.join("fixture-helper")));
+        player.use_render_protocol_fixture();
+        let stop_at = Instant::now();
+        player.close()?;
+        assert!(
+            player.stopping()
+                && !player.video_received()
+                && player.render_feedback()["stats"].is_null()
+        );
+        assert!(matches!(
+            wait_for_gui(&mut player)?,
+            chiaki::Update::Closed(_)
+        ));
+        assert!(stop_at.elapsed() < Duration::from_secs(3));
+        assert_exited(&renderer);
+        assert_exited(&helper);
+        if mode == "protocol" {
+            assert_eq!(fs::read(dir.join("fixture-stop"))?, b"direct-stop-no-sleep");
+        }
+        assert!(player.render_feedback()["stats"].is_null());
+    }
+    for name in [
+        "fixture-started",
+        "fixture-helper",
+        "fixture-mode",
+        "fixture-stop",
+    ] {
+        let _ = fs::remove_file(dir.join(name));
+    }
+    let mut host = TestChild(
+        Command::new(env::current_exe()?)
+            .arg("--fixture-owned-host")
+            .args([&root, &profile, &zip])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
     );
-    println!("public_gui: PowerShell failed-install stop, graceful cancellation and cleanup, checksum mismatch stop, UTF-16 path arguments, profile isolation handoff, image lock, single child, SDL background events, exit tracking and uninterrupted session after closing host passed");
+    let renderer = process_handle(await_pid(&dir.join("fixture-started")));
+    let helper = process_handle(await_pid(&dir.join("fixture-helper")));
+    host.0.kill()?; // No Rust destructors or on_exit callback can run here.
+    host.0.wait()?;
+    assert_exited(&renderer);
+    assert_exited(&helper);
+    assert_eq!(
+        unsafe { WaitForSingleObject(HANDLE(unrelated.0.as_raw_handle()), 0) },
+        WAIT_TIMEOUT
+    );
+    println!("public_gui: install/cancellation, profile isolation, image lock, background SDL, graceful embedded and independent exit, bounded headless exit, descendant cleanup, abrupt host termination and unrelated-process isolation passed");
     Ok(())
 }

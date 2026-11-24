@@ -1,0 +1,993 @@
+diff --git a/gui/CMakeLists.txt b/gui/CMakeLists.txt
+index 9cdbe8b..8dc0d5d 100755
+--- a/gui/CMakeLists.txt
++++ b/gui/CMakeLists.txt
+@@ -20,6 +20,10 @@ if(WIN32)
+ endif()
+ 
+ set(SOURCE_FILES
++ src/relaycapture.cpp
++ include/relaycapture.h
++ src/relaycontrol.cpp
++ include/relaycontrol.h
+ 	include/exception.h
+ 	src/main.cpp
+ 	include/discoverymanager.h
+@@ -295,3 +299,6 @@ install(TARGETS chiaki
+ install(FILES chiaking.desktop DESTINATION share/applications)
+ install(FILES chiaking.png DESTINATION share/icons/hicolor/512x512/apps)
+ install(FILES io.github.streetpea.Chiaki4deck.appdata.xml DESTINATION share/metainfo)
++
++find_library(RELAY_AVDEVICE avdevice REQUIRED)
++target_link_libraries(chiaki ${RELAY_AVDEVICE} strmiids oleaut32)
+diff --git a/gui/chiaking.rc.in b/gui/chiaking.rc.in
+index 908d938..c061aa4 100644
+--- a/gui/chiaking.rc.in
++++ b/gui/chiaking.rc.in
+@@ -21,14 +21,14 @@ BEGIN
+     BEGIN
+         BLOCK "080904b0"
+         BEGIN
+-            VALUE "Comments", "next-generation of Chiaki"
+-            VALUE "CompanyName", "Stret Pea"
+-            VALUE "FileDescription", "Open-Source PlayStation Remote Play App"
++            VALUE "Comments", "Relay video adapter derived from chiaki-ng; see bundled source and notices"
++            VALUE "CompanyName", "Relay contributors"
++            VALUE "FileDescription", "Relay Video"
+             VALUE "FileVersion", VER_FILEVERSION_STR
+             VALUE "InternalName", "chiaki-ng"
+             VALUE "LegalCopyright", "AGPLv3 Stret Pea 2022"
+             VALUE "OriginalFilename", "chiaki.exe"
+-            VALUE "ProductName", "chiaki-ng"
++            VALUE "ProductName", "Relay Player"
+             VALUE "ProductVersion", VER_PRODUCTVERSION_STR
+         END
+     END
+@@ -37,4 +37,4 @@ BEGIN
+         VALUE "Translation", 0x809, 1200
+     END
+ END
+-IDI_ICON1 ICON DISCARDABLE "chiaking.ico"
+\ No newline at end of file
++IDI_ICON1 ICON DISCARDABLE "relay.ico"
+diff --git a/gui/include/qmlmainwindow.h b/gui/include/qmlmainwindow.h
+index 18568fa..b91c5ef 100644
+--- a/gui/include/qmlmainwindow.h
++++ b/gui/include/qmlmainwindow.h
+@@ -2,6 +2,7 @@
+ 
+ #include "streamsession.h"
+ #include "settings.h"
++#include <QJsonObject>
+ #include "repeatcadence.h"
+ #include "neuralrender.h"
+ 
+@@ -50,6 +51,7 @@ class QOpenGLFramebufferObject;
+ class RtxVsr;
+ class NeuralRender;
+ class FrameGen;
++class RelayCapture;
+ class QWidget;
+ class QLabel;
+ class QVBoxLayout;
+@@ -123,6 +125,7 @@ public:
+     QmlMainWindow(Settings *settings,  bool exit_app_on_stream_exit = false);
+     QmlMainWindow(const StreamSessionConnectInfo &connect_info);
+     ~QmlMainWindow();
++    bool verifyRelayIntegration();
+     void updateWindowType(WindowType type);
+     void setSettings(Settings *new_settings);
+ 
+@@ -185,6 +188,28 @@ public:
+     Q_INVOKABLE void setStatsOverlayLayout(int style, int position);
+     Q_INVOKABLE void noteLoadingTransitionComplete();
+     Q_INVOKABLE void presentStartupWarmupFrame(unsigned width, unsigned height, bool hdr);
++    void enableRelayCapture(){direct_stream=true;emit directStreamChanged();}
++    RelayCapture *relay_capture=nullptr;
++    bool relay_capturing=false;
++    bool relay_delivering=false;
++    double relay_capture_pts=0;
++    void presentRelayCapture(AVFrame *frame,double fps);
++    void startRelayRenderTest();
++    void applyRelaySettings(const QJsonObject &command);
++    void reportRelayState();
++    QMutex relay_control_mutex;
++    QJsonObject relay_settings;
++    quint64 relay_revision = 0;
++    QAtomicInteger<quint64> relay_applied_revision = 0;
++    bool relay_parameters_valid = false;
++    pl_tex relay_target_texture=nullptr,relay_spatial_texture=nullptr;
++    QAtomicInteger<int> relay_upscaler_state=0,relay_filter_state=0;
++    quint64 relay_frame_index = 0;
++    QAtomicInteger<int> relay_source_width=0,relay_source_height=0,relay_output_width=0,relay_output_height=0;
++    QAtomicInteger<int> relay_source_kind=0, relay_nr_confirmed=0;
++    QAtomicInteger<qint64> relay_render_us=0;
++    const struct pl_hook *relay_filter_hook = nullptr;
++    const struct pl_hook *relay_artcnn_hook = nullptr;
+     void armVerbosePlaceboQuietWindow();
+     bool startupWarmupFrameActive() const { return startup_warmup_frame_active; }
+ 
+diff --git a/gui/include/settings.h b/gui/include/settings.h
+index ae9bc42..3237d6e 100644
+--- a/gui/include/settings.h
++++ b/gui/include/settings.h
+@@ -242,6 +242,7 @@ class Settings : public QObject
+ 		void ImportPlaceboSettings(QString filepath);
+ 
+ 		QMap<QString, QString> GetPlaceboValues();
++        void SetRelayRenderValue(const QString &key, const QVariant &v) { placebo_settings.setValue("placebo_settings/" + key, v); }
+ 
+ 		ChiakiDisableAudioVideo GetAudioVideoDisabled() const       { return static_cast<ChiakiDisableAudioVideo>(settings.value("settings/audio_video_disabled", 0).toInt()); }
+ 		void SetAudioVideoDisabled(ChiakiDisableAudioVideo disabled) { settings.setValue("settings/audio_video_disabled", disabled); }
+diff --git a/gui/include/streamsession.h b/gui/include/streamsession.h
+index 840f20e..e585907 100755
+--- a/gui/include/streamsession.h
++++ b/gui/include/streamsession.h
+@@ -344,6 +344,7 @@ class StreamSession : public QObject
+ 		void GoHome();
+ 		QString GetHost() { return host; }
+ 		bool GetConnected() { return connected; }
++        double GetProbeRttMs() const { return session.rtt_us / 1000.0; }
+ 		double GetMeasuredBitrate()	{ return measured_bitrate; }
+ 		double GetAveragePacketLoss()	{ return average_packet_loss; }
+ 		quint64 DecoderFlushGeneration() const { return decoder_flush_generation.loadRelaxed(); }
+diff --git a/gui/res/resources.qrc b/gui/res/resources.qrc
+index e922b37..3e150aa 100644
+--- a/gui/res/resources.qrc
++++ b/gui/res/resources.qrc
+@@ -1,5 +1,6 @@
+ <RCC>
+   <qresource prefix="/icons">
++    <file alias="relay.ico">../relay.ico</file>
+     <file>settings-20px.svg</file>
+     <file>add-24px.svg</file>
+     <file>discover-24px.svg</file>
+diff --git a/gui/src/controllermanager.cpp b/gui/src/controllermanager.cpp
+index 8bf27f3..fc38af7 100644
+--- a/gui/src/controllermanager.cpp
++++ b/gui/src/controllermanager.cpp
+@@ -619,7 +619,7 @@ inline bool Controller::HandleSensorEvent(SDL_ControllerSensorEvent event)
+ 			accel_x, accel_y, accel_z, true);
+ 			chiaki_orientation_tracker_update(
+ 				&orientation_tracker, state.gyro_x, state.gyro_y, state.gyro_z,
+-				accel_x, accel_y, accel_z, &accel_zero, false, event.timestamp * 1000);
++				accel_x, accel_y, accel_z, &accel_zero, true, event.timestamp * 1000);
+ 			break;
+ 		case SDL_SENSOR_GYRO:
+ 			gyro_x = event.data[0];
+diff --git a/gui/src/main.cpp b/gui/src/main.cpp
+index ed48835..7927df2 100644
+--- a/gui/src/main.cpp
++++ b/gui/src/main.cpp
+@@ -1,3 +1,7 @@
++#include "relaycapture.h"
++#include <QJsonDocument>
++#include <QRegularExpression>
++#include "relaycontrol.h"
+ 
+ // Use the native entry point instead of SDL's WinMain wrapper.
+ #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+@@ -76,10 +80,15 @@ int real_main(int argc, char *argv[])
+ 	qRegisterMetaType<ChiakiRegistEventType>();
+ 	qRegisterMetaType<ChiakiLogLevel>();
+ 
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1" && !qEnvironmentVariable("RELAY_RENDER_NAMESPACE").contains(QRegularExpression("^R[A-Z2-7]{5}$")))return 2;
+ 	QGuiApplication::setOrganizationName("Chiaki");
+ 	QGuiApplication::setApplicationName("Chiaki");
+-	QGuiApplication::setApplicationVersion(CHIAKI_VERSION);
+-	QGuiApplication::setApplicationDisplayName("chiaki-ng");
++	if(qEnvironmentVariable("RELAY_RENDER_NAMESPACE").contains(QRegularExpression("^R[A-Z2-7]{5}$"))) {
++        QCoreApplication::setOrganizationName(qEnvironmentVariable("RELAY_RENDER_NAMESPACE"));
++        QCoreApplication::setApplicationName(qEnvironmentVariable("RELAY_RENDER_NAMESPACE"));
++    }
++    QGuiApplication::setApplicationVersion(CHIAKI_VERSION);
++	QGuiApplication::setApplicationDisplayName(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1" ? "Relay Video" : "chiaki-ng");
+ #if defined(Q_OS_MACOS)
+ 	qputenv("QT_MTL_NO_TRANSACTION", "1");
+ #endif
+@@ -132,7 +141,7 @@ int real_main(int argc, char *argv[])
+ #ifdef Q_OS_MACOS
+ 	QGuiApplication::setWindowIcon(QIcon(":/icons/chiaking_macos.svg"));
+ #else
+-	QGuiApplication::setWindowIcon(QIcon(":/icons/chiaking.svg"));
++	QGuiApplication::setWindowIcon(QIcon(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1" ? ":/icons/relay.ico" : ":/icons/chiaking.svg"));
+ #endif
+ 
+ 	QCommandLineParser parser;
+@@ -193,8 +202,26 @@ int real_main(int argc, char *argv[])
+ 		use_alt_settings = true;
+ 
+ 	if(args.length() == 0)
++        return 2;
++    if(false)
+ 		return RunMain(app, use_alt_settings ? &alt_settings : &settings, exit_app_on_stream_exit);
+ 
++    if(args[0]=="relay-self-test" && qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1"){
++        QmlMainWindow window(use_alt_settings?&alt_settings:&settings,true);
++        return window.verifyRelayIntegration()?0:3;
++    }
++    if(args[0]=="relay-devices"){
++        auto devices=QJsonObject{{"type","devices"},{"devices",relayCaptureDevices()}};
++        std::printf("RELAY_RENDER %s\n",QJsonDocument(devices).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);return 0;
++    }
++    if(args[0]=="relay-capture"){
++        return RunMain(app,use_alt_settings?&alt_settings:&settings,true);
++    }
++    if(args[0]=="relay-render-test" && qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1"){
++        QmlMainWindow window(use_alt_settings?&alt_settings:&settings,true);
++        window.enableRelayCapture();window.show();window.startRelayRenderTest();relayControlStart(&window);
++        return app.exec();
++    }
+ 	if(args[0] == "list")
+ 	{
+ 		for(const auto &host : settings.GetRegisteredHosts())
+@@ -322,7 +349,9 @@ int real_main(int argc, char *argv[])
+ int RunMain(QGuiApplication &app, Settings *settings, bool exit_app_on_stream_exit)
+ {
+ 	QmlMainWindow main_window(settings, exit_app_on_stream_exit);
++    main_window.enableRelayCapture();
+ 	main_window.show();
++    relayControlStart(&main_window);
+ 	return app.exec();
+ }
+ 
+@@ -330,5 +359,6 @@ int RunStream(QGuiApplication &app, const StreamSessionConnectInfo &connect_info
+ {
+ 	QmlMainWindow main_window(connect_info);
+ 	main_window.show();
++    relayControlStart(&main_window);
+ 	return app.exec();
+ }
+diff --git a/gui/src/qml/qml.qrc b/gui/src/qml/qml.qrc
+index e05a068..4277ba1 100644
+--- a/gui/src/qml/qml.qrc
++++ b/gui/src/qml/qml.qrc
+@@ -2,6 +2,7 @@
+   <qresource prefix="/">
+     <file>qtquickcontrols2.conf</file>
+     <file>Main.qml</file>
++    <file>RelayView.qml</file>
+     <file>MainView.qml</file>
+     <file>StreamView.qml</file>
+     <file>StreamMenuWindow.qml</file>
+diff --git a/gui/src/qmlbackend.cpp b/gui/src/qmlbackend.cpp
+index 25af475..5f64d6f 100644
+--- a/gui/src/qmlbackend.cpp
++++ b/gui/src/qmlbackend.cpp
+@@ -1,4 +1,6 @@
+ #include "qmlbackend.h"
++#include <QJsonDocument>
++#include <cstdio>
+ #include "qmlsettings.h"
+ #include "qmlmainwindow.h"
+ #include "streamsession.h"
+@@ -718,6 +720,8 @@ bool QmlBackend::discoveryEnabled() const
+ 
+ void QmlBackend::setDiscoveryEnabled(bool enabled)
+ {
++    // Relay owns discovery, pairing and wake: never start a duplicate UDP listener.
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1")enabled=false;
+     discovery_manager.SetActive(enabled);
+     emit discoveryEnabledChanged();
+ }
+@@ -1145,6 +1149,14 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+         if (session != session_for_connections)
+             return;
+ 
++        if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1"){
++            // Only the library's fixed reason name, never the console's response
++            // (which may contain private addresses or authentication material).
++            const QJsonObject event{{"type","sessionEnded"},{"error",chiaki_quit_reason_is_error(reason)},
++                {"reasonCode",static_cast<int>(reason)},{"reason",QString::fromUtf8(chiaki_quit_reason_string(reason))}};
++            std::printf("RELAY_RENDER %s\n",QJsonDocument(event).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);
++        }
++
+         if (chiaki_quit_reason_is_error(reason)) {
+             QString m = tr("Chiaki Session has quit") + ":\n" + chiaki_quit_reason_string(reason);
+             if (!reason_str.isEmpty())
+@@ -1237,7 +1249,10 @@ bool QmlBackend::closeRequested()
+ {
+     if (!session)
+         return true;
+-
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")==QStringLiteral("1")) {
++        session->Stop();
++        return false;
++    }
+     bool stop = true;
+     if (session->IsConnected()) {
+         switch (settings->GetDisconnectAction()) {
+@@ -1836,7 +1851,7 @@ void QmlBackend::setIsAppActive()
+ 
+ uint32_t QmlBackend::getStreamShortcut() const
+ {
+-    if(!settings->GetStreamMenuEnabled())
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1" || !settings->GetStreamMenuEnabled())
+         return 0;
+ 	uint32_t stream_menu_shortcut1 = settings->GetStreamMenuShortcut1();
+ 	if(stream_menu_shortcut1 > 0)
+diff --git a/gui/src/qmlmainwindow.cpp b/gui/src/qmlmainwindow.cpp
+index f435a16..3f37bfc 100644
+--- a/gui/src/qmlmainwindow.cpp
++++ b/gui/src/qmlmainwindow.cpp
+@@ -1,3 +1,10 @@
++#include "relayfilters.h"
++#include "relaytelemetry.h"
++#include "relaypolicy.h"
++#include "relaycapture.h"
++#include <QJsonDocument>
++#include <QFile>
++#include <QDir>
+ #include "qmlmainwindow.h"
+ #include "rtxvsr.h"
+ #include "neuralrender.h"
+@@ -7,6 +14,8 @@
+ #include "chiaki/log.h"
+ #include "chiaki/time.h"
+ #include "streamsession.h"
++#include "controllermanager.h"
++#include <QScreen>
+ 
+ #include <qpa/qplatformnativeinterface.h>
+ 
+@@ -2727,6 +2736,7 @@ QmlMainWindow::QmlMainWindow(const StreamSessionConnectInfo &connect_info)
+ 
+ QmlMainWindow::~QmlMainWindow()
+ {
++    if(relay_capture){delete relay_capture;relay_capture=nullptr;}
+     Q_ASSERT(!placebo_swapchain);
+ 
+     if (stats_overlay_widget) {
+@@ -2851,6 +2861,9 @@ QmlMainWindow::~QmlMainWindow()
+     rtx_vsr = nullptr;
+     delete neural_render;
+     neural_render = nullptr;
++    if(relay_target_texture) pl_tex_destroy(placeboGpu(), &relay_target_texture);
++    if(relay_spatial_texture) pl_tex_destroy(placeboGpu(), &relay_spatial_texture);
++    pl_mpv_user_shader_destroy(&relay_filter_hook);pl_mpv_user_shader_destroy(&relay_artcnn_hook);
+     pl_renderer_destroy(&placebo_renderer);
+     // User shader hooks hold a reference to the GPU (their descriptors destroy
+     // buffers/textures via p->gpu), so they must be released before the GPU is.
+@@ -2989,6 +3002,7 @@ void QmlMainWindow::setOverlayInteractionActive(bool active)
+ 
+ void QmlMainWindow::setStatsOverlayActive(bool active)
+ {
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1")active=false;
+     const bool previous = stats_overlay_visible;
+     stats_overlay_visible = active;
+     if (stats_overlay_widget)
+@@ -3071,7 +3085,8 @@ void QmlMainWindow::setSettings(Settings *new_settings)
+ 
+ void QmlMainWindow::show()
+ {
+-    QQmlComponent component(qml_engine, QUrl(QStringLiteral("qrc:/Main.qml")));
++    const bool relay = qEnvironmentVariable("RELAY_RENDER_PROTOCOL") == "1";
++    QQmlComponent component(qml_engine, QUrl(relay ? QStringLiteral("qrc:/RelayView.qml") : QStringLiteral("qrc:/Main.qml")));
+     if (!component.isReady()) {
+         qCCritical(chiakiGui) << "Component not ready\n" << component.errors();
+         QMetaObject::invokeMethod(QGuiApplication::instance(), &QGuiApplication::quit, Qt::QueuedConnection);
+@@ -3086,12 +3101,31 @@ void QmlMainWindow::show()
+         QMetaObject::invokeMethod(QGuiApplication::instance(), &QGuiApplication::quit, Qt::QueuedConnection);
+         return;
+     }
++    if (relay && !pending_renderer_fallback_reason.isEmpty()) {
++        QJsonObject error{{"type","error"},{"message",QStringLiteral("渲染器已回退，请在运行状态查看当前渲染器。")}};
++        std::printf("RELAY_RENDER %s\n",QJsonDocument(error).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);
++        pending_renderer_fallback_reason.clear();
++    }
+     if (!pending_renderer_fallback_reason.isEmpty()) {
+         const QString reason = pending_renderer_fallback_reason;
+         pending_renderer_fallback_reason.clear();
+         QMetaObject::invokeMethod(quick_item, "showRendererFallbackDialog",
+                                   Q_ARG(QVariant, QVariant::fromValue(reason)));
+     }
++    if (property("relay-self-test").toBool()) return;
++#ifdef Q_OS_WIN
++    if (relay) {
++        // The verified Relay parent adopts this HWND before it becomes visible.
++        // No top-level window or swapchain is exposed during the handoff.
++        setFlags(Qt::Window | Qt::FramelessWindowHint);
++        resize(1280, 720);
++        create();
++        SetPropW(reinterpret_cast<HWND>(winId()), L"RelayPlayer.VideoReady.V1",
++                 reinterpret_cast<HANDLE>(static_cast<uintptr_t>(GetCurrentProcessId())));
++        setWindowAdjustable(false);
++        return;
++    }
++#endif
+     auto screen_size = QGuiApplication::primaryScreen()->availableSize();
+     resize(screen_size);
+ 
+@@ -3201,11 +3235,15 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
+ 
+     if (!frame.frame)
+         return;
++    if(relay_capturing && !relay_delivering){av_frame_free(&frame.frame);return;}
++    relay_source_kind.storeRelaxed(relay_delivering ? 2 : 1);
+     stream_frames_current.fetchAndAddRelaxed(1);
+ 
+     if (bypass_frame_queue) {
+-        const bool repeat = repeat_detector.feed(frame.packet_size);
+-        const int cadence = repeat_detector.cadence();
++        const auto dedup=relay_settings.value("frameDedup").toString("auto");
++        const bool detected_repeat=repeat_detector.feed(frame.packet_size);
++        const bool repeat=dedup=="off"?false:dedup=="60-to-30"?(++relay_frame_index%2==0):detected_repeat;
++        const int cadence = dedup=="off"?1:dedup=="60-to-30"?2:repeat_detector.cadence();
+         if (fg_source_cadence.fetchAndStoreRelaxed(cadence) != cadence) {
+             qCInfo(chiakiGui).nospace() << "Source cadence: "
+                 << (cadence == 2 ? "every picture repeated (e.g. 30 fps game in a 60 fps stream)"
+@@ -5000,6 +5038,11 @@ void QmlMainWindow::doneOpenGLContextCurrent()
+ 
+ void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
+ {
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1"){
++        settings->SetStreamMenuEnabled(false);settings->SetShowStreamStats(false);
++        settings->SetFrameGenBackend(0);settings->SetNeuralRender(false);
++        settings->SetDirectFrameMapping(true);
++    }
+     bypass_frame_queue = settings->GetDirectFrameMapping();
+     render_backend = settings->GetRenderBackend();
+     setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
+@@ -5337,7 +5380,17 @@ renderer_backend_ready:
+     connect(qml_engine, &QQmlEngine::quit, this, &QWindow::close);
+ 
+     backend = new QmlBackend(settings, this);
+-    stats_overlay_widget = new StatsOverlayWidget(this, backend);
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")!="1")
++        stats_overlay_widget = new StatsOverlayWidget(this, backend);
++    else {
++        auto report=[](const QString &message){
++            QJsonObject event{{"type","error"},{"message",message}};
++            std::printf("RELAY_RENDER %s\n",QJsonDocument(event).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);
++        };
++        connect(backend,&QmlBackend::error,this,[report](const QString &,const QString &){report(QStringLiteral("播放组件连接失败，请检查主机状态与网络后重试。"));});
++        // SessionQuit emits the fixed sessionEnded reason through the protocol.
++        connect(backend,&QmlBackend::sessionPinDialogRequested,this,[]{std::printf("RELAY_RENDER {\"type\":\"pinRequired\",\"required\":true}\n");std::fflush(stdout);});
++    }
+     connect(backend, &QmlBackend::sessionChanged, this, [this, exit_app_on_stream_exit](StreamSession *s) {
+         const bool preserve_startup_warmup = s && startup_warmup_preserve_next_session_change;
+         startup_warmup_preserve_next_session_change = false;
+@@ -5448,7 +5501,7 @@ renderer_backend_ready:
+             quick_need_render.storeRelaxed(1);
+             setStreamMaxFPS(60);
+             setStreamWindowAdjustable(false);
+-            if(qEnvironmentVariable("XDG_CURRENT_DESKTOP") != "gamescope")
++            if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL") != "1" && qEnvironmentVariable("XDG_CURRENT_DESKTOP") != "gamescope")
+             {
+                 if(!this->settings->GetGeometry().isEmpty())
+                 {
+@@ -6702,6 +6755,10 @@ void QmlMainWindow::handleVulkanRendererFallback(const QString &title, const QSt
+             backend->stopSession(false);
+         }
+ 
++        if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1"){
++            std::printf("RELAY_RENDER {\"type\":\"error\",\"message\":\"Vulkan renderer failed; update the graphics driver and reconnect\"}\n");std::fflush(stdout);
++            QTimer::singleShot(0,QGuiApplication::instance(),&QGuiApplication::quit);return;
++        }
+         QProcess process;
+         process.setProgram(QCoreApplication::applicationFilePath());
+         process.setArguments(QCoreApplication::arguments().mid(1));
+@@ -6718,6 +6775,7 @@ void QmlMainWindow::handleVulkanRendererFallback(const QString &title, const QSt
+ 
+ void QmlMainWindow::render()
+ {
++    QMutexLocker relay_lock(&relay_control_mutex);
+     Q_ASSERT(QThread::currentThread() == render_thread);
+     if (vulkan_device_lost.loadAcquire() != 0) {
+         QMutexLocker locker(&render_schedule_mutex);
+@@ -6989,6 +7047,7 @@ void QmlMainWindow::render()
+                 qCInfo(chiakiGui) << "Updated custom render parameters with one or more invalid parameters.";
+             else
+                 qCInfo(chiakiGui) << "Updated custom render parameters successfully.";
++            relay_parameters_valid = !invalid_render_params;
+         }
+         render_params = &(this->renderparams_opts->params);
+         break;
+@@ -7392,6 +7451,8 @@ void QmlMainWindow::render()
+     // Submit immediately and let the swapchain / render path enforce pacing.
+     auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present) -> bool {
+         const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
++        if (present && submit_ready_us >= start_frame_us)
++            relay_render_us.storeRelaxed(submit_ready_us-start_frame_us);
+         const int queue_depth_now = snapshotQueueDepth();
+         if (detailedVerboseTelemetryEnabled()) {
+             static qint64 last_present_trace_log_us = 0;
+@@ -7609,6 +7670,9 @@ void QmlMainWindow::render()
+     }
+     if (!hint_frame && frame_mix.num_frames)
+         hint_frame = frame_mix.frames[0];
++    const pl_frame *relay_input_frame=bypass_frame_queue && direct_frame.num_planes>0?&direct_frame:hint_frame;
++    const int relay_input_width=relay_input_frame?qRound(fabsf(pl_rect_w(relay_input_frame->crop))):0;
++    const int relay_input_height=relay_input_frame?qRound(fabsf(pl_rect_h(relay_input_frame->crop))):0;
+     struct pl_color_space hint = hint_frame ? hint_frame->color : pl_color_space{};
+     struct pl_color_space target_csp = sw_frame.color_space;
+     if (target_csp.hdr.max_luma <= 0.0f) {
+@@ -7695,8 +7759,12 @@ void QmlMainWindow::render()
+         .parts = &overlay_part,
+         .num_parts = 1,
+     };
+-    target_frame.overlays = &overlay;
+-    target_frame.num_overlays = 1;
++    // Relay has no native controls to composite. An empty Quick scene is not a
++    // video layer; never let an unpainted overlay cover the decoded picture.
++    if (qEnvironmentVariable("RELAY_RENDER_PROTOCOL") != "1") {
++        target_frame.overlays = &overlay;
++        target_frame.num_overlays = 1;
++    }
+     if(target_prim)
+     {
+         target_frame.color.primaries = static_cast<pl_color_primaries>(target_prim);
+@@ -7810,7 +7878,7 @@ void QmlMainWindow::render()
+             if (render_entry_us_local > 0 && render_after_us >= render_entry_us_local)
+                 logLatencyStats("render_work", render_after_us - render_entry_us_local);
+         }
+-        close_started_frame(true);
++    close_started_frame(true);
+         bool scheduled_pending = finalize_render();
+         if (!scheduled_pending)
+             schedulePostRenderWork();
+@@ -7853,6 +7921,29 @@ void QmlMainWindow::render()
+     }
+ #endif
+ 
++    // Render to the selected processing size, then fit that result into the player.
++    // This makes a 4K processing target effective even in a smaller window.
++    const pl_frame relay_display_target=target_frame;
++    bool relay_offscreen=false;
++    const auto relay_target=relay_settings.value("upscalerTarget").toString("auto");
++    const bool verify_present=qEnvironmentVariable("RELAY_RENDER_VERIFY_PRESENT")=="1";
++    if(hint_frame && (verify_present || (relay_target!="auto" && relay_settings.value("upscaler").toString("off")!="off"))){
++        const int h=verify_present && relay_target=="auto"?swapchain_size.height():relay_target=="2160p"?2160:relay_target=="1440p"?1440:1080;
++        const int w=qRound(h*fabsf(pl_rect_w(hint_frame->crop))/qMax(1.0f,fabsf(pl_rect_h(hint_frame->crop))));
++        pl_tex_params tp={};tp.w=w;tp.h=h;tp.format=pl_find_named_fmt(placeboGpu(),"rgba16hf");tp.renderable=true;tp.sampleable=true;
++        if(tp.format && pl_tex_recreate(placeboGpu(),&relay_target_texture,&tp)){
++            target_frame={};target_frame.num_planes=1;target_frame.planes[0].texture=relay_target_texture;target_frame.planes[0].components=4;
++            for(int i=0;i<4;i++)target_frame.planes[0].component_mapping[i]=i;
++            target_frame.repr=pl_color_repr_rgb;target_frame.color=relay_display_target.color;
++            target_frame.crop={0,0,static_cast<float>(w),static_cast<float>(h)};relay_offscreen=true;
++        }
++    }
++    if (hint_frame && relay_settings.value("upscaler").toString()=="integer") {
++        const float sw=fabsf(pl_rect_w(hint_frame->crop)), sh=fabsf(pl_rect_h(hint_frame->crop));
++        const float dw=fabsf(pl_rect_w(target_frame.crop)),dh=fabsf(pl_rect_h(target_frame.crop));
++        const int factor=sw>0&&sh>0?static_cast<int>(qMin(dw/sw,dh/sh)):0;
++        if(factor>=1){const float x=(target_frame.crop.x0+target_frame.crop.x1)*0.5f,y=(target_frame.crop.y0+target_frame.crop.y1)*0.5f;target_frame.crop={x-sw*factor/2,y-sh*factor/2,x+sw*factor/2,y+sh*factor/2};}
++    }
+     const struct pl_hook *fsrcnnx_hook = nullptr;
+     if (hint_frame) {
+         const float src_width = fabsf(pl_rect_w(hint_frame->crop));
+@@ -7865,10 +7956,12 @@ void QmlMainWindow::render()
+                                                fsr_hook, fsrcnnx_hook_8, fsrcnnx_hook_16);
+         }
+     }
+-    const struct pl_hook *active_hooks[2] = {};
++    const struct pl_hook *active_hooks[4] = {};
+     int num_active_hooks = 0;
+     if (fsrcnnx_hook)
+         active_hooks[num_active_hooks++] = fsrcnnx_hook;
++    if (relay_artcnn_hook) active_hooks[num_active_hooks++] = relay_artcnn_hook;
++    if (relay_filter_hook) active_hooks[num_active_hooks++] = relay_filter_hook;
+     // AMD RCAS on the final image: after scaling, RTX VSR and frame
+     // generation, so it also sharpens 1:1 output.
+     const int rcas_strength = has_settings ? settings->GetRcasStrength() : 0;
+@@ -8005,22 +8098,13 @@ void QmlMainWindow::render()
+     // How many frames frame generation makes per source picture: the multiplier asked for,
+     // held back by the display. Also sets the status note on what the display holds back.
+     auto plan_fg_multiplier = [&](int cadence, double source_interval_s, double refresh_hz) {
+-        // More output frames than the display can show only adds latency.
+-        const int refresh_cap = source_interval_s > 0.0
+-            ? static_cast<int>(std::floor(refresh_hz * source_interval_s + 0.15))
+-            : 2;
+-        const int multiplier = qMin(settings->GetFrameGenMultiplier() * cadence, refresh_cap);
+-        // When the display holds back the multiplier asked for, the status says what it would take.
+-        // Counted per source picture like the status's own number: 4x of a 30 fps stream needs 120 Hz.
+-        // Never more than the backend can make (4 until it has started), so a half-rate source with 4x
+-        // at 150 Hz, already at the backend's 4 per picture, gets no note.
+-        const int fg_max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
+-        const int fg_requested = qMin(settings->GetFrameGenMultiplier() * cadence, fg_max_known);
+-        const bool fg_capped = refresh_cap < fg_requested && source_interval_s > 0.0;
+-        fg_status_requested.storeRelaxed(fg_capped ? fg_requested : 0);
+-        fg_status_needed_hz.storeRelaxed(fg_capped ? static_cast<int>(std::lround(fg_requested / source_interval_s)) : 0);
++        const int max_known = frame_gen && frame_gen->maxMultiplier() > 1 ? frame_gen->maxMultiplier() : 4;
++        const auto plan = relayFrameGenPlan(settings->GetFrameGenMultiplier(),cadence,source_interval_s,
++            refresh_hz,max_known,qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1");
++        fg_status_requested.storeRelaxed(plan.limited_request);
++        fg_status_needed_hz.storeRelaxed(plan.needed_hz);
+         fg_status_refresh_hz.storeRelaxed(static_cast<int>(std::lround(refresh_hz)));
+-        return multiplier;
++        return plan.multiplier;
+     };
+     // Pipelined frame generation: start the stream frame taken above (fg_pipe_stage). Its
+     // DLSS 5 (or, without it, its DLSS FG) is queued on D3D12 now; the rest follows in
+@@ -8127,6 +8211,27 @@ void QmlMainWindow::render()
+         nr_status_hdr.storeRelaxed(nr_applied && nr_hdr ? 1 : 0);
+     }
+ 
++    bool relay_spatial_applied=false;
++    const auto relay_algorithm=relay_settings.value("upscaler").toString("off");
++    // Spatial reconstruction precedes frame generation, so selecting both keeps both algorithms.
++    if(bypass_frame_queue && !fg_override && direct_render_frame.num_planes>0 && settings->GetFrameGenBackend()>0 &&
++       (relay_algorithm=="fsr1" || relay_algorithm=="artcnn" || relay_algorithm=="integer")){
++        const int w=qRound(fabsf(pl_rect_w(target_frame.crop))),h=qRound(fabsf(pl_rect_h(target_frame.crop)));
++        if(w>fabsf(pl_rect_w(direct_render_frame.crop)) || h>fabsf(pl_rect_h(direct_render_frame.crop))){
++            pl_tex_params tp={};tp.w=w;tp.h=h;tp.format=pl_find_named_fmt(placeboGpu(),"rgba16hf");tp.renderable=true;tp.sampleable=true;
++            if(tp.format && pl_tex_recreate(placeboGpu(),&relay_spatial_texture,&tp)){
++                pl_frame spatial={};spatial.num_planes=1;spatial.planes[0].texture=relay_spatial_texture;spatial.planes[0].components=4;
++                for(int i=0;i<4;i++)spatial.planes[0].component_mapping[i]=i;
++                spatial.repr=pl_color_repr_rgb;spatial.color=direct_render_frame.color;spatial.crop={0,0,float(w),float(h)};
++                auto sp=pl_render_fast_params;sp.upscaler=relay_algorithm=="integer"?&pl_filter_nearest:&pl_filter_bilinear;
++                const pl_hook *hook=relay_algorithm=="fsr1"?fsrcnnx_hook:relay_artcnn_hook;
++                if(hook){sp.hooks=&hook;sp.num_hooks=1;}
++                if(pl_render_image(placebo_renderer,&direct_render_frame,&spatial,&sp)){
++                    direct_render_frame=spatial;relay_spatial_applied=true;
++                }
++            }
++        }
++    }
+     // RTX Video Super Resolution: replace each source frame with an NVIDIA
+     // upscaled RGB frame at the output size, so libplacebo only color maps it
+     // and scales it ~1:1. Any failure keeps the regular libplacebo path.
+@@ -8265,7 +8370,7 @@ void QmlMainWindow::render()
+                 fg_active_cadence = cadence;
+                 fg_applied = true;
+                 // RTX VSR has no split into a D3D12 half, so it keeps the frames unpipelined.
+-                fg_pipe_allowed = backend_choice == FrameGen::Backend::Dlss12 && !vsr_applied;
++                fg_pipe_allowed = backend_choice == FrameGen::Backend::Dlss12 && !vsr_applied && !relay_spatial_applied;
+             }
+         }
+     }
+@@ -8321,8 +8426,11 @@ void QmlMainWindow::render()
+         // The frame already is at display size; skip the shader upscalers
+         // but keep RCAS, which sharpens the final image.
+         const bool rcas_active = num_active_hooks > 0 && active_hooks[num_active_hooks - 1] == rcas_hook;
+-        params.hooks = rcas_active ? &active_hooks[num_active_hooks - 1] : nullptr;
+-        params.num_hooks = rcas_active ? 1 : 0;
++        num_active_hooks = 0;
++        if (relay_filter_hook) active_hooks[num_active_hooks++] = relay_filter_hook;
++        if (rcas_active) active_hooks[num_active_hooks++] = rcas_hook;
++        params.hooks = active_hooks;
++        params.num_hooks = num_active_hooks;
+     }
+     // Generated frames reuse the last stream frame's VSR state.
+     if (!fg_override) {
+@@ -8374,6 +8482,45 @@ void QmlMainWindow::render()
+                 logLatencyStats("render_work", render_after_us - render_entry_us_local);
+         }
+     }
++    const auto relay_errors=pl_renderer_get_errors(placebo_renderer);
++    auto hookOk=[&](const pl_hook *hook){if(!hook)return false;for(int i=0;i<relay_errors.num_disabled_hooks;i++)if(relay_errors.disabled_hooks[i]==hook->signature)return false;return true;};
++    const bool relay_scaling=relay_input_width>0 && (fabsf(pl_rect_w(target_frame.crop))>relay_input_width+0.5f || fabsf(pl_rect_h(target_frame.crop))>relay_input_height+0.5f);
++    const auto chosen=relay_settings.value("upscaler").toString("off");
++    int actual=0;
++    if(chosen=="rtx-vsr" && vsr_applied)actual=2;
++    else if(chosen=="fsr1" && relay_scaling && hookOk(fsrcnnx_hook))actual=1;
++    else if(chosen=="artcnn" && relay_scaling && hookOk(relay_artcnn_hook) && (!fg_applied || relay_spatial_applied) && !vsr_applied)actual=3;
++    else if(chosen=="integer" && relay_scaling)actual=4;
++    if(!fg_override)relay_upscaler_state.storeRelaxed(actual);
++    relay_filter_state.storeRelaxed(hookOk(relay_filter_hook)?1:0);
++    if(nr_status_state.loadRelaxed()==1)relay_nr_confirmed.storeRelease(1);
++    relay_source_width.storeRelaxed(relay_input_width);
++    relay_source_height.storeRelaxed(relay_input_height);
++    relay_output_width.storeRelaxed(static_cast<int>(fabsf(pl_rect_w(target_frame.crop))));
++    relay_output_height.storeRelaxed(static_cast<int>(fabsf(pl_rect_h(target_frame.crop))));
++    if(verify_present && relay_offscreen && !property("relay-readback-done").toBool()){
++        pl_tex_params tp={};tp.w=32;tp.h=18;tp.format=pl_find_named_fmt(placeboGpu(),"rgba8");tp.renderable=true;tp.host_readable=true;
++        pl_tex sample=tp.format?pl_tex_create(placeboGpu(),&tp):nullptr;
++        if(sample){
++            pl_frame image={};image.num_planes=1;image.planes[0].texture=sample;image.planes[0].components=4;
++            for(int i=0;i<4;i++)image.planes[0].component_mapping[i]=i;
++            image.repr=pl_color_repr_rgb;image.color=pl_color_space_srgb;image.crop={0,0,32,18};
++            auto copy=pl_render_fast_params;copy.frame_mixer=nullptr;
++            unsigned char pixels[32*18*4]={};pl_tex_transfer_params transfer={};transfer.tex=sample;transfer.ptr=pixels;
++            const bool ok=pl_render_image(placebo_renderer,&target_frame,&image,&copy) && pl_tex_download(placeboGpu(),&transfer);
++            int nonblack=0,minimum=255,maximum=0;
++            if(ok)for(int i=0;i<32*18;i++){const int v=qMax(pixels[i*4],qMax(pixels[i*4+1],pixels[i*4+2]));nonblack+=v>8;minimum=qMin(minimum,v);maximum=qMax(maximum,v);}
++            std::printf("RELAY_RENDER {\"type\":\"presentVerification\",\"readback\":%s,\"nonblackPixels\":%d,\"range\":%d}\n",ok?"true":"false",nonblack,maximum-minimum);std::fflush(stdout);
++            setProperty("relay-readback-done",true);pl_tex_destroy(placeboGpu(),&sample);
++        }
++    }
++    if(relay_offscreen){
++        auto copy=pl_render_fast_params;copy.frame_mixer=nullptr;
++        if(!pl_render_image(placebo_renderer,&target_frame,&relay_display_target,&copy)){
++            close_started_frame(false);finalize_render();schedulePostSwapchainRecreateRefresh();return;
++        }
++    }
++    if(relay_parameters_valid && relay_errors.errors==PL_RENDER_ERR_NONE)relay_applied_revision.storeRelease(relay_revision);
+     close_started_frame(true);
+ 
+     if (startup_video_visible_refresh_pending.loadAcquire() != 0) {
+@@ -8448,6 +8595,7 @@ void QmlMainWindow::fgPipeAdvance(bool drain)
+ 
+ bool QmlMainWindow::handleShortcut(QKeyEvent *event)
+ {
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")=="1")return false;
+     if (event->modifiers() == Qt::NoModifier) {
+         switch (event->key()) {
+         case Qt::Key_F11:
+@@ -8675,3 +8823,183 @@ QObject *QmlMainWindow::focusObject() const
+ {
+     return quick_window->focusObject();
+ }
++
++void QmlMainWindow::reportRelayState()
++{
++ if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL") != QStringLiteral("1")) return;
++ const int nr=nr_status_state.loadRelaxed(), fg=fg_status_backend.loadRelaxed();
++ const int multiplier=fg_status_multiplier.loadRelaxed();
++ const bool confirmed=relay_nr_confirmed.loadAcquire()!=0 || nr==1;
++ const auto fg_name=fg==1?"dlssg":fg==2?"fsr":fg==3?"flow":fg==4?"nvidia-vfg":fg==5?"dlssg-dx12":"off";
++ QJsonObject st;
++ st["type"]="stats"; st["revision"]=static_cast<double>(relay_applied_revision.loadAcquire());
++ st["neuralRendering"]=nr==1?"on":nr==3?"unavailable":nr==2?"preparing":"off";
++ if(nr==1 && nr_status_gpu_cms.loadRelaxed()>0)st["neuralRenderingMs"]=nr_status_gpu_cms.loadRelaxed()/100.0;
++ if(nr==3)st["neuralRenderingReason"]="NR 初始化或帧处理失败，请检查当前运行库与显卡驱动";
++ st["frameGeneration"]=multiplier>1?fg_name:"off";
++ st["frameGenerationMultiplier"]=multiplier>1?multiplier:1;
++ st["frameGenerationBackend"]=multiplier>1?fg_name:"off";
++ st["frameGenerationRequestedMultiplier"]=relay_settings.value("frameGenerationMultiplier");
++ st["frameGenerationSourceFps"]=stream_fps/qMax(1,fg_source_cadence.loadRelaxed());
++ const int fg_reason=fg_status_reason.loadRelaxed();
++ st["frameGenerationReason"]=fg_reason==1?"需要直接帧映射":fg_reason==2?"显卡、驱动或运行库无法启动所选补帧引擎":fg_reason==3?"显示器刷新率不足，请降低源帧率或选择 60→30 后补帧":"";
++ st["fps"]=stream_fps;st["outputFps"]=display_fps;
++ st["displayFps"]=display_fps;
++ st["width"]=relay_source_width.loadRelaxed();st["height"]=relay_source_height.loadRelaxed();
++ st["outputWidth"]=relay_output_width.loadRelaxed();st["outputHeight"]=relay_output_height.loadRelaxed();
++ st["filtersApplied"]=relay_filter_state.loadRelaxed()==1;
++ const int source=relay_source_kind.loadRelaxed();
++ if(source)st["pictureSource"]=source==2?"capture":"stream";
++ st["captureOnly"]=relay_capturing && !(session && session->IsConnected());
++ if(relay_capture){const auto capture=relay_capture->metrics();for(auto it=capture.begin();it!=capture.end();++it)st[it.key()]=it.value();}
++ if(session && session->IsConnected()){
++  st["bitrateKbps"]=session->GetMeasuredBitrate()*1000.0;
++  st["lossPct"]=session->GetAveragePacketLoss()*100.0;
++  st["netProbeRttMs"]=session->GetProbeRttMs();
++  st["framesLost"]=session->GetFramesLost();
++  QStringList names;for(auto controller:session->GetControllers())if(controller->IsConnected())names<<controller->GetName();
++  st["controllerSummary"]=names.isEmpty()?QStringLiteral("未连接实体手柄"):names.join(QStringLiteral("、"));
++ }
++ const auto render_us=relay_render_us.loadRelaxed();
++ if(render_us>0)st["renderSubmitMs"]=render_us/1000.0;
++ st["focused"]=isActive();
++ st["requestedUpscaler"]=relay_settings.value("upscaler");
++ st["targetBitrateKbps"]=relay_settings.value("bitrateKbps");
++ st["bitrateLocked"]=relay_settings.value("lockBitrate");
++ const int up=relay_upscaler_state.loadRelaxed();
++ st["activeUpscaler"]=up==1?"fsr1":up==2?"rtx-vsr":up==3?"artcnn":up==4?"integer":"off";
++ st["upscalerUnavailable"]=relay_settings.value("upscaler").toString()=="rtx-vsr" && (vsr_status_state.loadRelaxed()==3 || !nvidia_card);
++ auto driver=QString::fromUtf8(vk_device_driver_props.driverInfo).trimmed();
++ if(driver.isEmpty() && vk_device_props.driverVersion)driver=QStringLiteral("驱动编码 0x%1").arg(vk_device_props.driverVersion,8,16,QChar('0'));
++ const auto display=screen();
++ const auto gpu=relayGpuReport(gpu_name,driver,render_backend==RenderBackend::Vulkan,
++     NeuralRender::compiledIn(),nr,confirmed,display?display->size()*display->devicePixelRatio():QSize(),
++     display?display->refreshRate():0.0);
++ st["gpu"]=gpu;
++ std::printf("RELAY_RENDER %s\n",QJsonDocument(st).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);
++}
++void QmlMainWindow::applyRelaySettings(const QJsonObject &command)
++{
++ if(command.value("type").toString()=="pin"){
++  const auto pin=command.value("pin").toString();
++  if(pin.size()!=4 || !std::all_of(pin.begin(),pin.end(),[](QChar c){return c>=QChar('0')&&c<=QChar('9');}))return;
++  if(session){backend->enterPin(pin);std::printf("RELAY_RENDER {\"type\":\"pinRequired\",\"required\":false}\n");std::fflush(stdout);}
++  return;
++ }
++ if(command.value("type").toString()=="stop"){
++  // An explicit Relay stop never asks about sleep and never sends a standby request.
++  if(session)backend->stopSession(false);else QCoreApplication::quit();
++  return;
++ }
++ if(command.value("type").toString()=="devices"){
++  QJsonObject devices{{"type","devices"},{"devices",relayCaptureDevices()}};
++  std::printf("RELAY_RENDER %s\n",QJsonDocument(devices).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);return;
++ }
++ if(command.value("type").toString()!="settings" || !command.value("settings").isObject()) return;
++ auto next=command.value("settings").toObject();
++ drainRenderThread();
++ if(next.value("pictureSource").toString()=="capture" && !next.value("captureDeviceId").toString().isEmpty()){
++  bool capture_changed=!relay_capture;
++  for(auto key:{"captureDeviceId","captureWidth","captureHeight","captureFps","captureFormat","captureColorRange","captureHdrMode"})if(next.value(key)!=relay_settings.value(key))capture_changed=true;
++  if(capture_changed){
++  if(relay_capture){delete relay_capture;relay_capture=nullptr;}
++  relay_capturing=true;direct_stream=true;emit directStreamChanged();stream_session_active.storeRelease(1);
++  relay_capture=new RelayCapture(this,next);relay_capture->start();
++  }
++ }else if(relay_capture){delete relay_capture;relay_capture=nullptr;relay_capturing=false;}
++ QMutexLocker relay_lock(&relay_control_mutex);
++ relay_upscaler_state.storeRelaxed(0);
++ relay_settings=next;relay_revision=static_cast<quint64>(command.value("revision").toDouble());
++ auto number=[&](const char*k,double d){return next.value(k).toDouble(d);};
++ auto text=[&](const char*k,const char*d){return next.value(k).toString(QString::fromUtf8(d));};
++ auto flag=[&](const char*k){return next.value(k).toBool(false);};
++ settings->SetPlaceboPreset(PlaceboPreset::Custom);
++ settings->SetNeuralRender(flag("neuralRendering"));settings->SetNeuralRenderUpscale(false);
++ NeuralRenderTuning t;const double strength=number("neuralRenderingIntensity",1.0);
++ t.intensity=qBound(0.0,strength,1.0);t.local_structure=qBound(0.0,strength,2.0);
++ t.style=text("neuralRenderingPreset","default")=="cinematic"?2:text("neuralRenderingPreset","default")=="natural"?1:0;
++ settings->SetNeuralRenderPasses(1);settings->SetNeuralRenderTuning(0,t);
++ settings->SetFrameGenBackend(!flag("frameGeneration")?0:text("frameGenerationBackend","warp")=="dlssg"?1:text("frameGenerationBackend","warp")=="nvidia"?4:3);
++ settings->SetFrameGenMultiplier(qBound(2,static_cast<int>(number("frameGenerationMultiplier",2)),4));
++ settings->SetFrameGenCleanup(1);
++ settings->SetDirectFrameMapping(true);settings->SetVSyncEnabled(text("framePacing","auto")=="smooth-vsync");
++ const auto tone=text("toneMapMode","auto");
++ settings->SetDisplayTargetTrc(tone=="bt2390-sdr"?PL_COLOR_TRC_BT_1886:tone=="hdr10-passthrough"?PL_COLOR_TRC_PQ:0);
++ settings->SetDisplayTargetPrim(tone=="bt2390-sdr"?PL_COLOR_PRIM_BT_709:tone=="hdr10-passthrough"?PL_COLOR_PRIM_BT_2020:0);
++ settings->SetDisplayTargetPeak(tone=="bt2390-sdr"?203:0);
++ settings->SetRelayRenderValue("tone_mapping",tone=="bt2390-sdr"?"bt2390":"spline");
++ pl_renderer_reset_errors(placebo_renderer,nullptr);
++ settings->SetAmbientBorder(flag("ambientFill"));settings->SetRcasStrength(qRound(number("upscalerSharpness",0)*100));
++ const auto algorithm=text("upscaler","off");
++ settings->SetPlaceboUpscaler(algorithm=="fsr1"?PlaceboUpscaler::FSR:algorithm=="integer"?PlaceboUpscaler::Nearest:PlaceboUpscaler::Bilinear);
++ settings->SetRtxVsrQuality(algorithm=="rtx-vsr" ? qMax(1,text("upscalerQuality","0").toInt()==0?4:text("upscalerQuality","0").toInt()) : 0);
++ settings->SetRelayRenderValue("deband",flag("debanding")?"yes":"no");
++ settings->SetRelayRenderValue("deband_iterations",text("debandingStrength","medium")=="high"?3:1);
++ settings->SetRelayRenderValue("deband_threshold",text("debandingStrength","medium")=="low"?2:4);
++ settings->SetRelayRenderValue("sigmoid",flag("antiAliasing")?"yes":"no");
++ settings->SetRelayRenderValue("color_adjustment","yes");
++ settings->SetRelayRenderValue("saturation",QString::number(number("saturation",1),'f',3));
++ settings->SetRelayRenderValue("contrast",QString::number(number("contrast",1),'f',3));
++ settings->SetRelayRenderValue("gamma",QString::number(number("gamma",1),'f',3));
++ settings->SetRelayRenderValue("temperature",QString::number(number("colorTemperature",0),'f',3));
++ if(relay_filter_hook){pl_mpv_user_shader_destroy(&relay_filter_hook);}
++ if(relay_artcnn_hook){pl_mpv_user_shader_destroy(&relay_artcnn_hook);}
++ const auto shader=relayFilterShader(next);
++ relay_filter_hook=pl_mpv_user_shader_parse(placeboGpu(),shader.constData(),shader.size());
++ if(algorithm=="artcnn"){
++  QString artPath=QCoreApplication::applicationDirPath()+"/relay-artcnn/"+(text("artcnnStyle","auto")=="denoise"?"ArtCNN_C4F16_DN.glsl":"ArtCNN_C4F16.glsl");
++  relay_artcnn_hook=load_mpv_hook(placeboGpu(),artPath);
++ }
++ setVideoPreset(VideoPreset::Custom);renderparams_changed=true;settings->SetPlaceboFrameMixer(PlaceboFrameMixer::None);
++ if(!property("relay-reporting").toBool()){
++  setProperty("relay-reporting",true);auto timer=new QTimer(this);timer->setInterval(1000);
++  connect(timer,&QTimer::timeout,this,&QmlMainWindow::reportRelayState);timer->start();
++ }
++ requestOverlayUpdate();
++ QJsonObject ack{{"type","settingsAccepted"},{"revision",static_cast<double>(relay_revision)}};
++ std::printf("RELAY_RENDER %s\n",QJsonDocument(ack).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);
++}
++
++void QmlMainWindow::presentRelayCapture(AVFrame *frame,double fps){
++ fps=fps>0?fps:60;relay_capture_pts+=1.0/fps;
++ stream_configured_frame_interval_ms=1000.0/fps;
++ relay_delivering=true;
++ presentFrame(ChiakiFfmpegFrame{.frame=frame,.pts=relay_capture_pts,.duration=1.0/fps,.recovered=false,.packet_size=65536},0);
++ relay_delivering=false;
++}
++
++void QmlMainWindow::startRelayRenderTest(){
++    // Deterministic synthetic pixels, no device, console or account is accessed.
++    relay_capturing=true;stream_session_active.storeRelease(1);
++    auto timer=new QTimer(this);timer->setInterval(16);
++    connect(timer,&QTimer::timeout,this,[this]{
++        AVFrame *frame=av_frame_alloc();if(!frame)return;
++        frame->format=AV_PIX_FMT_RGB24;frame->width=640;frame->height=360;
++        frame->color_range=AVCOL_RANGE_JPEG;frame->colorspace=AVCOL_SPC_RGB;
++        frame->color_primaries=AVCOL_PRI_BT709;frame->color_trc=AVCOL_TRC_BT709;
++        if(av_frame_get_buffer(frame,32)<0){av_frame_free(&frame);return;}
++        for(int y=0;y<frame->height;y++)for(int x=0;x<frame->width;x++){
++            auto p=frame->data[0]+y*frame->linesize[0]+x*3;p[0]=32+x*200/640;p[1]=16+y*100/360;p[2]=220-x*160/640;
++        }
++        presentRelayCapture(frame,60);
++    });timer->start();
++}
++
++bool QmlMainWindow::verifyRelayIntegration()
++{
++    setProperty("relay-self-test",true);
++    show();
++    const auto initial=QJsonDocument::fromJson(qgetenv("RELAY_RENDER_SETTINGS"));
++    if(initial.isObject())applyRelaySettings(QJsonObject{{"type","settings"},{"revision",1},{"settings",initial.object()}});
++    setStatsOverlayActive(true);
++    backend->setDiscoveryEnabled(true);
++    QKeyEvent menu(QEvent::KeyPress,Qt::Key_O,Qt::ControlModifier);
++    const bool shortcut_ignored=!handleShortcut(&menu);
++    const bool surface=quick_item && quick_item->objectName()=="relay-video-surface";
++    const bool clean=surface && !stats_overlay_widget && !stats_overlay_visible && !backend->discoveryEnabled() && shortcut_ignored;
++    QJsonObject result{{"type","integrationTest"},{"videoOnlyRoot",surface},{"noStatsOverlay",!stats_overlay_widget && !stats_overlay_visible},
++      {"discoveryDisabled",!backend->discoveryEnabled()},{"nativeShortcutsDisabled",shortcut_ignored},
++      {"configuredMultiplier",settings->GetFrameGenMultiplier()},{"configuredFrameGenBackend",settings->GetFrameGenBackend()}};
++    std::printf("RELAY_RENDER %s\n",QJsonDocument(result).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);
++    return clean;
++}
+diff --git a/gui/tools/fgdx12test.cpp b/gui/tools/fgdx12test.cpp
+index a4423b0..98f0d04 100644
+--- a/gui/tools/fgdx12test.cpp
++++ b/gui/tools/fgdx12test.cpp
+@@ -1,3 +1,10 @@
++#include "relayfilters.h"
++#include "relaytelemetry.h"
++#include "relaypolicy.h"
++#include <QJsonDocument>
++#include <libplacebo/options.h>
++#include <libplacebo/shaders/custom.h>
++#include <QFile>
+ // chiaki-fgdx12test: console test of chiaki-ng's frame generation backends, driven the way
+ // the renderer drives them: synthetic frames of a moving pattern go through FrameGen::process
+ // on a libplacebo Vulkan device, and the generated frames are read back and compared with
+@@ -639,9 +646,74 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
+ 
+ } // namespace
+ 
++
++static int relayRenderTests(){
++ Rig r;if(!r.init()||!r.resize(96,64))return 3;
++ std::vector<uint8_t> input(96*64*4);
++ for(int y=0;y<64;y++)for(int x=0;x<96;x++){int i=(y*96+x)*4;input[i]=40+(x%13)*9;input[i+1]=30+(y%11)*8;input[i+2]=90;input[i+3]=255;}
++ r.uploadRgba(input.data());auto src=r.sourceFrame();
++ auto options=pl_options_alloc(r.log);int failures=0;
++ const char *pairs[][2]={{"deband","yes"},{"deband_iterations","3"},{"deband_threshold","4"},{"sigmoid","yes"},{"color_adjustment","yes"},{"saturation","1.2"},{"contrast","1.1"},{"gamma","1.1"},{"temperature","0.3"},{"tone_mapping","bt2390"}};
++ for(auto &p:pairs){if(!pl_options_set_str(options,p[0],p[1])){std::printf("FAIL option %s\n",p[0]);failures++;}}
++ auto output=[&](const pl_render_params &params,std::vector<uint8_t> &bytes){auto dst=src;dst.planes[0].texture=r.readback;bool ok=pl_render_image(r.renderer,&src,&dst,&params);bytes.resize(input.size());pl_tex_transfer_params dn={};dn.tex=r.readback;dn.ptr=bytes.data();dn.row_pitch=96*4;return ok&&pl_tex_download(r.gpu,&dn);};
++ std::vector<uint8_t> baseline,modified;auto neutral=pl_render_fast_params;neutral.dither_params=nullptr;
++ if(!output(neutral,baseline))failures++;
++ if(!output(options->params,modified)||baseline==modified){std::printf("FAIL color pixels unchanged\n");failures++;}else std::printf("PASS color controls changed pixels\n");
++ for(const auto key:{"clarity","textureRecovery","vibrance","shadowBoost","filmGrain"}){
++  QJsonObject settings{{key,0.8}};const auto code=relayFilterShader(settings);auto hook=pl_mpv_user_shader_parse(r.gpu,code.constData(),code.size());auto p=neutral;p.hooks=&hook;p.num_hooks=1;
++  if(!hook||!output(p,modified)||baseline==modified||pl_renderer_get_errors(r.renderer).errors){std::printf("FAIL shader %s\n",key);failures++;}else std::printf("PASS shader %s changed pixels\n",key);
++  pl_mpv_user_shader_destroy(&hook);pl_renderer_reset_errors(r.renderer,nullptr);
++ }
++ // Reconstruct to 2x, execute real ArtCNN/FSR hooks, then read it back.
++ for(const auto path:{"relay-artcnn/ArtCNN_C4F16.glsl","relay-artcnn/ArtCNN_C4F16_DN.glsl","fsr.glsl"}){
++  QFile file(QString::fromUtf8(path));if(!file.open(QIODevice::ReadOnly)){std::printf("FAIL missing %s\n",path);failures++;continue;}
++  auto bytes=file.readAll();auto hook=pl_mpv_user_shader_parse(r.gpu,bytes.constData(),bytes.size());
++  pl_tex_params tp={};tp.w=192;tp.h=128;tp.format=pl_find_named_fmt(r.gpu,"rgba8");tp.renderable=true;tp.host_readable=true;pl_tex tex=pl_tex_create(r.gpu,&tp);
++  auto dst=src;dst.planes[0].texture=tex;dst.crop={0,0,192,128};auto p=neutral;p.hooks=&hook;p.num_hooks=1;
++  bool ok=hook&&tex&&pl_render_image(r.renderer,&src,&dst,&p)&&pl_renderer_get_errors(r.renderer).errors==0;
++  std::printf("%s GPU hook %s\n",ok?"PASS":"FAIL",path);if(!ok)failures++;
++  pl_tex_destroy(r.gpu,&tex);pl_mpv_user_shader_destroy(&hook);pl_renderer_reset_errors(r.renderer,nullptr);
++ }
++ pl_options_free(&options);r.destroy();std::printf("RELAY RENDER TESTS: %d failures\n",failures);return failures?1:0;
++}
++
++int relayTelemetryTest()
++{
++ Rig r;if(!r.init() || !r.resize(320,180))return 10;
++ auto get=reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(r.inst->get_proc_addr(r.inst->instance,"vkGetPhysicalDeviceProperties2"));
++ if(!get)return 11;
++ VkPhysicalDeviceDriverProperties driver={};driver.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
++ VkPhysicalDeviceProperties2 props={};props.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;props.pNext=&driver;
++ get(r.vk->phys_device,&props);
++ auto before=relayGpuReport(QString::fromUtf8(props.properties.deviceName),QString::fromUtf8(driver.driverInfo),true,NeuralRender::compiledIn(),0,false,QSize(),0);
++ if(before.contains("dlssNrSupported") || before.contains("dlssNrReported") || before.contains("displayHz"))return 12;
++ std::vector<uint8_t> image(320*180*4,128);r.uploadRgba(image.data());auto src=r.sourceFrame();
++ NeuralRender nr(r.log);pl_frame rendered={};uint64_t signature=0;
++ bool applied=nr.ensureInitialized(r.vk) && nr.process(&src,100,NeuralRender::Options{},&rendered,&signature);
++ auto gpu=relayGpuReport(QString::fromUtf8(props.properties.deviceName),QString::fromUtf8(driver.driverInfo),true,NeuralRender::compiledIn(),applied?1:3,applied,QSize(),0);
++ if(applied && (!gpu["dlssNrReported"].toBool() || !gpu["dlssNrSupported"].toBool()))return 13;
++ auto failed=relayGpuReport("Test","Test",true,true,3,true,QSize(),0);
++ if(!failed["dlssNrReported"].toBool() || failed["dlssNrSupported"].toBool())return 14;
++ QJsonObject result{{"gpu",gpu},{"nrFrameProcessed",applied},{"nrMs",nr.gpuTimeMs()},{"noAssumedCapability",true},{"noInventedDisplay",true},{"failurePreservesHardwareEvidence",true}};
++ std::printf("RELAY_TELEMETRY_TEST %s\n",QJsonDocument(result).toJson(QJsonDocument::Compact).constData());
++ nr.destroy();return applied?0:15;
++}
+ int main(int argc, char **argv)
+ {
+     QCoreApplication app(argc, argv);
++    if(argc>1 && std::string(argv[1])=="--relay-policy-test"){
++        int failures=0,cases=0;
++        for(int requested:{2,3,4})for(int cadence:{1,2})for(int source_fps:{30,60})for(int hz:{60,120,144,240})for(int max:{2,3,4}){
++            auto p=relayFrameGenPlan(requested,cadence,1.0/source_fps,hz,max,true);
++            const int expected=std::max(1,std::min({requested,max,static_cast<int>(std::floor(double(hz)/source_fps+0.15))}));
++            if(p.multiplier!=expected || p.multiplier>requested)failures++;cases++;
++        }
++        if(relayFrameGenPlan(2,2,1.0/30,120,4,true).multiplier!=2)failures++;
++        if(relayFrameGenPlan(2,2,1.0/30,120,4,false).multiplier!=4)failures++;
++        std::printf("RELAY_POLICY_TEST cases=%d failures=%d\n",cases,failures);return failures?1:0;
++    }
++    if(argc>1 && std::string(argv[1])=="--relay-telemetry-test")return relayTelemetryTest();
++    if(argc>1 && std::string(argv[1])=="--relay-render-test")return relayRenderTests();
+ #if defined(_WIN32)
+     // 1 ms timer resolution, as chiaki-ng sets it while streaming (windowsStreamTuning.cpp): waits
+     // for Streamline's frames sleep 1 ms at a time.
+diff --git a/lib/src/orientation.c b/lib/src/orientation.c
+index a350737..8fbc534 100644
+--- a/lib/src/orientation.c
++++ b/lib/src/orientation.c
+@@ -12,7 +12,7 @@
+ #define BETA_WARMUP 20.0f
+ #define BETA_DEFAULT 0.05f
+ 
+-#define ORIENT_FUZZ 0.0007f
++#define ORIENT_FUZZ 0.0f
+ #define FUZZ_FILTER_PREV_WEIGHT 0.75f
+ #define FUZZ_FILTER_PREV_WEIGHT2x 0.6f
+ 

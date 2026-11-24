@@ -4,7 +4,9 @@
 param(
     [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$InstallRoot,
     [string]$ArchivePath,
-    [switch]$VerifyOnly
+    [switch]$VerifyOnly,
+    [switch]$CommunityNr,
+    [switch]$RelayRender
 )
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
@@ -20,6 +22,23 @@ $treeSize = [long]315854122
 $originalSize = 6543375
 $originalHash = 'c69a1e2dbf7406f74ae8a33c7c98fba226d79431a36aca5bc7143cedc4d19dec'
 $profileOffset = 0x221dbb
+if ($RelayRender) { $CommunityNr = $true }
+$runtimeName = 'chiaki-ng'
+$archiveEntries = $fileCount + $dirCount + 1
+if ($CommunityNr) {
+    $runtimeName = 'chiaki-nr'
+    $archiveUrl = 'https://github.com/windystrife/chiaki-ng-Ultimate/releases/download/1.10.0-dlss5.7/chiaki-ng-1.10.0-dlss5.7-win_x64-portable.zip'
+    $archiveSize = [long]271677844
+    $archiveHash = 'b07e58000ebf38545518c955ad9462ad8fac30dc8e0438ff44d5119d93c91ebe'
+    $treeHash = '096fa9ded30152d4d800fb5d8c48ef3c8175b7b764e7b9b5e0c3078e099efad4'
+    $fileNamesHash = 'ce702af0fc2631280afc04c7636bb2314d5eea41c2439f2302decd77d4ce9456'
+    $dirNamesHash = '8f38c86eb10ef8e66f69e61cfe1b4550adbb561a218b1f878419a7d6a3234a63'
+    $fileCount = 1438; $dirCount = 69; $archiveEntries = 1452
+    $treeSize = [long]629530922
+    $originalSize = 5536256
+    $originalHash = '3488b8a2c6564f006b1447dc42b67e0fbafc5293963ee3af073a3f95e7db3e26'
+    $profileOffset = 0x45d124
+}
 $utf = [Text.UTF8Encoding]::new($false)
 $cancelEvent = $null
 $ioBuffer = [byte[]]::new(524288)
@@ -87,6 +106,51 @@ function Child-Path([string]$Parent, [string]$Name) {
 function Name-Digest([string[]]$Names, $Sha) {
     return (Hex ($Sha.ComputeHash($utf.GetBytes([string]::Join("`n", $Names) + "`n"))))
 }
+function Assert-NrModel([string]$Path) {
+    Assert-Unlinked $Path
+    $file = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        # This original 310.9.16 model is unsigned. Pin its complete bytes instead of
+        # accepting a version string, trusting a modified legacy DLL, or claiming a signature.
+        if ($file.Length -ne 276162560 -or
+            (Stream-Digest $file $sha) -cne 'cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed') {
+            throw 'The DLSS NR model must be the verified original 310.9.16 build. Modified or unknown runtime files are not accepted.'
+        }
+    } finally { $sha.Dispose(); $file.Dispose() }
+}
+# These local, hash-bound changes are the compiled equivalent of
+# docs/patches/dualsense-motion.patch. They remove quaternion deadband and
+# preserve raw SDL gravity after a motion reset. No protocol or credentials change.
+function Update-MotionImage([byte[]]$Image, [bool]$Restore = $false) {
+    $fixes = @(
+        @(0x4823ec,'3480b739','00000000'), @(0x4823f0,'3480373a','00000000'),
+        @(0x4823fc,'3480b73a','00000000'), @(0x66ce7,'00','01')
+    )
+    if ($CommunityNr) {
+        $fixes = @(
+            @(0x44e6c4,'3480b739','00000000'), @(0x44e6c8,'3480b7b9','00000000'),
+            @(0x44e6cc,'3480373a','00000000'), @(0x44e6d0,'348037ba','00000000'),
+            @(0x44e6d4,'3480b73a','00000000'), @(0x44e6d8,'3480b7ba','00000000'),
+            @(0x65cfa,'00','01')
+        )
+    }
+    $old = $true; $new = $true
+    foreach ($fix in $fixes) {
+        $offset = [int]$fix[0]; $before = [string]$fix[1]; $after = [string]$fix[2]
+        for ($i=0; $i -lt $before.Length/2; $i++) {
+            $old = $old -and ($Image[$offset+$i] -eq [Convert]::ToByte($before.Substring($i*2,2),16))
+            $new = $new -and ($Image[$offset+$i] -eq [Convert]::ToByte($after.Substring($i*2,2),16))
+        }
+    }
+    if ($Restore -and $old) { return } # Accept a verified v0.1.8 local profile too.
+    if ((!$Restore -and !$old) -or ($Restore -and !$new)) { throw 'Motion patch bytes differ from the reviewed runtime.' }
+    foreach ($fix in $fixes) {
+        $offset = [int]$fix[0]; $value = [string]$fix[$(if ($Restore) { 1 } else { 2 })]
+        for ($i=0; $i -lt $value.Length/2; $i++) { $Image[$offset+$i] = [Convert]::ToByte($value.Substring($i*2,2),16) }
+    }
+}
+
 function Test-ProfileImage([IO.FileInfo]$File) {
     # This one optional derivative is never a replacement for an upstream file. Undo only the
     # six-byte local profile name and compare the whole image with the pinned original. The
@@ -105,6 +169,7 @@ function Test-ProfileImage([IO.FileInfo]$File) {
         }
     } finally { $image.Dispose() }
     if ($bytes.Length -ne $originalSize -or [Text.Encoding]::ASCII.GetString($bytes,$profileOffset,6) -cnotmatch '^R[A-Z2-7]{5}$') { return $false }
+    try { Update-MotionImage $bytes $true } catch { return $false }
     [Array]::Copy([Text.Encoding]::ASCII.GetBytes('Chiaki'), 0, $bytes, $profileOffset, 6)
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ((Hex ($sha.ComputeHash($bytes))) -ceq $originalHash) } finally { $sha.Dispose() }
@@ -114,8 +179,8 @@ function Test-KnownRuntime([string]$Path) {
     # NOT sufficient for launching. Do not traverse links or read arbitrary paths inside it.
     foreach ($probe in @(
         @('chiaki.exe',$originalSize,$originalHash),
-        @('platforms/qwindows.dll',1527707,'b1cab650819e13f13427215558b3bc714e05a628b78dcaa4c2565991952fb3de'),
-        @('imageformats/qjpeg.dll',66404,'891d27e92f807fffd894b6016f055aa26302f1c50062aaff8ed7e5949b16f409')
+        $(if ($CommunityNr) { @('platforms/qwindows.dll',925920,'133983755958a0f4d955b4a6f3712a014ac62351ec5edd3c32b802094f66ac96') } else { @('platforms/qwindows.dll',1527707,'b1cab650819e13f13427215558b3bc714e05a628b78dcaa4c2565991952fb3de') }),
+        $(if ($CommunityNr) { @('imageformats/qjpeg.dll',576736,'43ca4ed440f9f03e79f75fd76905e3350ec4008650d02d7041fdd2ac4043dfd2') } else { @('imageformats/qjpeg.dll',66404,'891d27e92f807fffd894b6016f055aa26302f1c50062aaff8ed7e5949b16f409') })
     )) {
         Assert-Preparing
         $probePath = Child-Path $Path $probe[0]
@@ -146,6 +211,11 @@ function Verify-Tree([string]$Path, [bool]$AllowProfile = $false) {
             Assert-Preparing
             if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Runtime contains a redirected file or directory.' }
             $rel = $entry.FullName.Substring($prefix.Length).Replace('\','/')
+            if ($CommunityNr -and $rel -ceq 'nvngx_dlssnr.dll') {
+                if ($entry -isnot [IO.FileInfo]) { throw 'The DLSS NR model must be a regular file.' }
+                Assert-NrModel $entry.FullName
+                continue
+            }
             if ($AllowProfile -and $rel -ceq 'relay-profile.exe') {
                 if ($entry -isnot [IO.FileInfo] -or !(Test-ProfileImage $entry)) { throw 'The isolated player image failed verification.' }
                 continue
@@ -177,7 +247,7 @@ function Verify-Tree([string]$Path, [bool]$AllowProfile = $false) {
     } finally { $sha.Dispose() }
 }
 
-function Get-OfficialArchive([string]$Destination) {
+function Get-OfficialArchive([string]$Destination, [string]$Url = $archiveUrl, [long]$ExpectedSize = $archiveSize) {
     Add-Type -AssemblyName System.Net.Http
     # Automatic redirects on older .NET versions can downgrade HTTPS. Follow only GitHub release asset hosts.
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -187,8 +257,8 @@ function Get-OfficialArchive([string]$Destination) {
     $handler.UseDefaultCredentials = $false
     $client = [Net.Http.HttpClient]::new($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(90)
-    $client.DefaultRequestHeaders.UserAgent.ParseAdd('RelayPlayer/0.1.8')
-    $uri = [Uri]$archiveUrl
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('RelayPlayer/0.1.9')
+    $uri = [Uri]$Url
     $allowed = @('github.com','release-assets.githubusercontent.com','objects.githubusercontent.com','github-releases.githubusercontent.com')
     $response = $null; $request = [Threading.CancellationTokenSource]::new()
     try {
@@ -205,7 +275,7 @@ function Get-OfficialArchive([string]$Destination) {
             $response.Dispose(); $response = $null
         }
         $size = $response.Content.Headers.ContentLength
-        if ($null -ne $size -and $size -ne $archiveSize) { throw 'Unexpected upstream release download size.' }
+        if ($null -ne $size -and $size -ne $ExpectedSize) { throw 'Unexpected upstream release download size.' }
         $pending = $response.Content.ReadAsStreamAsync()
         Wait-Transfer $pending ([DateTime]::UtcNow.AddSeconds(90)) $request
         $source = $pending.GetAwaiter().GetResult()
@@ -215,7 +285,7 @@ function Get-OfficialArchive([string]$Destination) {
             try {
                 $buffer = [byte[]]::new(262144); $received = [long]0; $next = [long]0
                 $deadline = [DateTime]::UtcNow.AddMinutes(30)
-                Report 'download' 0 $archiveSize
+                Report 'download' 0 $ExpectedSize
                 while ($true) {
                     Assert-Preparing $request
                     $pending = $source.ReadAsync($buffer,0,$buffer.Length,$request.Token)
@@ -224,15 +294,47 @@ function Get-OfficialArchive([string]$Destination) {
                     Wait-Transfer $pending $readDeadline $request
                     $read = $pending.GetAwaiter().GetResult(); if ($read -eq 0) { break }
                     $received += $read
-                    if ($received -gt $archiveSize -or [DateTime]::UtcNow -gt $deadline) { throw 'Upstream download exceeded its size or time limit.' }
+                    if ($received -gt $ExpectedSize -or [DateTime]::UtcNow -gt $deadline) { throw 'Upstream download exceeded its size or time limit.' }
                     $dest.Write($buffer,0,$read)
-                    if ($received -ge $next) { Report 'download' $received $archiveSize; $next = $received + 2097152 }
+                    if ($received -ge $next) { Report 'download' $received $ExpectedSize; $next = $received + 2097152 }
                 }
-                if ($received -ne $archiveSize) { throw 'The upstream release download was incomplete.' }
-                Report 'download' $received $archiveSize
+                if ($received -ne $ExpectedSize) { throw 'The upstream release download was incomplete.' }
+                Report 'download' $received $ExpectedSize
             } finally { $dest.Dispose() }
         } finally { $source.Dispose() }
     } finally { if ($response) { $response.Dispose() }; $client.Dispose(); $request.Dispose() }
+}
+function Install-NrModel([string]$Stage, [string]$Payload) {
+    $targetModel = Child-Path $Payload 'nvngx_dlssnr.dll'
+    if ($env:RELAY_NR_MODEL) {
+        $model = [IO.Path]::GetFullPath($env:RELAY_NR_MODEL)
+        Assert-NrModel $model
+        $inputModel = [IO.File]::Open($model,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        try {
+            $outputModel = [IO.File]::Open($targetModel,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            try { $inputModel.CopyTo($outputModel,262144) } finally { $outputModel.Dispose() }
+        } finally { $inputModel.Dispose() }
+    } else {
+        $modelZip = Child-Path $Stage 'nr-model.zip'
+        Get-OfficialArchive $modelZip 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.9.16/nvngx_dlssnr_310.9.16.zip' 192378839
+        $inputModel = [IO.File]::Open($modelZip,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            if ($inputModel.Length -ne 192378839 -or (Stream-Digest $inputModel $sha) -cne 'dbeb1f2790b5c621887db99b1a56ac8bd5cb35207e8c074cbb806710f7460cab') { throw 'The DLSS NR model archive failed verification.' }
+            $inputModel.Position = 0
+            $zipModel = [IO.Compression.ZipArchive]::new($inputModel,[IO.Compression.ZipArchiveMode]::Read,$true)
+            try {
+                $entries = @($zipModel.Entries | Where-Object { $_.FullName -ceq 'nvngx_dlssnr.dll' })
+                if ($entries.Count -ne 1 -or $entries[0].Length -ne 276162560) { throw 'The DLSS NR model archive has unexpected contents.' }
+                $sourceModel = $entries[0].Open()
+                $outputModel = [IO.File]::Open($targetModel,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+                try {
+                    while (($n = $sourceModel.Read($ioBuffer,0,$ioBuffer.Length)) -gt 0) { Assert-Preparing; $outputModel.Write($ioBuffer,0,$n) }
+                } finally { $outputModel.Dispose(); $sourceModel.Dispose() }
+            } finally { $zipModel.Dispose() }
+        } finally { $sha.Dispose(); $inputModel.Dispose() }
+    }
+    Assert-NrModel $targetModel
 }
 function Expand-OfficialArchive([string]$Archive, [string]$Destination) {
     Add-Type -AssemblyName System.IO.Compression
@@ -246,12 +348,13 @@ function Expand-OfficialArchive([string]$Archive, [string]$Destination) {
         $zip = [IO.Compression.ZipArchive]::new($source, [IO.Compression.ZipArchiveMode]::Read, $true)
         try {
             $zipPrefix = 'chiaki-ng-Win/'
-            if ($zip.Entries.Count -ne ($fileCount + $dirCount + 1)) { throw 'Unexpected number of release archive entries.' }
+            if ($zip.Entries.Count -ne $archiveEntries) { throw 'Unexpected number of release archive entries.' }
             $count = 0; $sum = [long]0
             Report 'extract' 0 $fileCount
             foreach ($entry in $zip.Entries) {
                 Assert-Preparing
                 $name = $entry.FullName
+                if ($CommunityNr) { $name = $name.Replace('\','/') }
                 if (!$name.StartsWith($zipPrefix, [StringComparison]::Ordinal)) { throw 'Unexpected archive root.' }
                 $rel = $name.Substring($zipPrefix.Length)
                 if ($rel -ceq '') { continue }
@@ -259,7 +362,7 @@ function Expand-OfficialArchive([string]$Archive, [string]$Destination) {
                 $rel = $rel.TrimEnd('/')
                 if ($rel -cnotmatch '^[A-Za-z0-9_+.@-]+(/[A-Za-z0-9_+.@-]+)*$' -or $rel -match '(^|/)(\.{1,2}|[^/]+\.|(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.[^/]*)?)(/|$)') { throw 'Unusable archive path.' }
                 $kind = ($entry.ExternalAttributes -shr 16) -band 0xf000
-                if (($directory -and $kind -ne 0x4000) -or (!$directory -and $kind -ne 0x8000)) { throw 'The archive contains an unexpected file type.' }
+                if (!($CommunityNr -and $entry.ExternalAttributes -eq 0) -and (($directory -and $kind -ne 0x4000) -or (!$directory -and $kind -ne 0x8000))) { throw 'The archive contains an unexpected file type.' }
                 $out = Child-Path $Destination $rel
                 if ($directory) { [void][IO.Directory]::CreateDirectory($out); continue }
                 $sum += $entry.Length
@@ -309,7 +412,7 @@ function Prepare {
     $root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
     if ($root.Length -le 3) { throw 'Use a dedicated installation directory, not a drive root.' }
     Assert-Unlinked $root
-    $target = Child-Path $root 'chiaki-ng'
+    $target = Child-Path $root $runtimeName
     if ($VerifyOnly -and ![IO.Directory]::Exists($target)) { throw 'The runtime has not been installed.' }
     [void][IO.Directory]::CreateDirectory($root)
     $lockPath = Child-Path $root '.chiaki-install.lock'
@@ -329,11 +432,11 @@ function Prepare {
         Assert-Unlinked $target
         $repair = $false
         if ([IO.Directory]::Exists($target)) {
-            try { Verify-Tree $target $true; Assert-Preparing; Report 'ready' 1 1; return }
+            try { Verify-Tree $target $true; if ($CommunityNr) { Assert-NrModel (Child-Path $target 'nvngx_dlssnr.dll') }; Assert-Preparing; Report 'ready' 1 1; return }
             catch {
                 Assert-Preparing # Cancellation is not corruption and must never start a repair.
                 if ($VerifyOnly) { throw 'The installed runtime failed verification. VerifyOnly does not change it.' }
-                if (!(Test-KnownRuntime $target)) { throw 'Unrecognized backends/chiaki-ng folder. Back it up under a different name before retrying.' }
+                if (!(Test-KnownRuntime $target)) { throw 'Unrecognized runtime folder. Back it up under a different name before retrying.' }
                 $repair = $true; Report 'repair' 0 1
             }
         }
@@ -349,6 +452,10 @@ function Prepare {
         else { $archive = Child-Path $stage 'upstream.zip'; Get-OfficialArchive $archive }
         Expand-OfficialArchive $archive $payload
         Verify-Tree $payload
+        if ($CommunityNr) {
+            Install-NrModel $stage $payload
+            Verify-Tree $payload
+        }
         # Rename whole trees on one volume. Old contents (including any internal links) are
         # preserved as-is; no recursive move, delete or overlay of the damaged installation.
         # Complete and verify the replacement BEFORE touching the old installation.
@@ -356,7 +463,7 @@ function Prepare {
         $backup = $null
         if ($repair) {
             if (!(Test-KnownRuntime $target)) { throw 'The existing runtime changed while preparing. Retry after closing other players.' }
-            $backup = Child-Path $root ('chiaki-ng.backup-' + [Guid]::NewGuid().ToString('N'))
+            $backup = Child-Path $root ($runtimeName + '.backup-' + [Guid]::NewGuid().ToString('N'))
             Assert-Unlinked $backup
             if ([IO.File]::Exists($backup) -or [IO.Directory]::Exists($backup)) { throw 'Backup name collision. Retry without changing the original.' }
         }
@@ -374,7 +481,7 @@ function Prepare {
                     Assert-Unlinked $target; Assert-Unlinked $backup
                     if ([IO.Directory]::Exists($target) -or [IO.File]::Exists($target)) { throw 'Target occupied.' }
                     [IO.Directory]::Move($backup, $target)
-                } catch { throw 'Repair could not switch or restore the active path. The original runtime is preserved under backends/chiaki-ng.backup-*.' }
+                } catch { throw 'Repair could not switch or restore the active path. The original runtime is preserved under the runtime backup folder.' }
                 throw 'Repair could not switch the runtime. The original directory was restored; close other players and retry.'
             }
             throw

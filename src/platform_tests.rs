@@ -111,8 +111,13 @@ fn create_silent_output(
 #[ignore = "internal subprocess fixture"]
 fn fixture_child_process() {
     match std::env::var(FIXTURE).ok().as_deref() {
-        Some("video") => unsafe {
-            let class = w!("RelayPlaybackWindow");
+        Some("video" | "qt" | "qt-pending") => unsafe {
+            let pending = std::env::var(FIXTURE).as_deref() == Ok("qt-pending");
+            let class = if std::env::var(FIXTURE).as_deref() != Ok("video") {
+                w!("Qt681QWindowIcon")
+            } else {
+                w!("RelayPlaybackWindow")
+            };
             let instance = GetModuleHandleW(std::ptr::null());
             let atom = RegisterClassW(&WNDCLASSW {
                 lpfnWndProc: Some(fixture_proc),
@@ -136,7 +141,16 @@ fn fixture_child_process() {
                 None,
             )
             .unwrap();
-            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            if pending {
+                SetPropW(
+                    h,
+                    w!("RelayPlayer.VideoReady.V1"),
+                    windows::Win32::Foundation::HANDLE(std::process::id() as usize as *mut _),
+                )
+                .unwrap();
+            } else {
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            }
             SetTimer(h, 1, 15000, None);
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -161,11 +175,22 @@ fn fixture_child_process() {
 }
 #[test]
 fn embeds_a_separate_process_only_in_its_video_area_and_restores_it() {
-    let mut child = Fixture::spawn("video");
+    check_embedding("video", false);
+}
+#[test]
+fn embeds_exact_owned_qt_stream_and_restores_it_without_accepting_foreign_pid() {
+    check_embedding("qt", true);
+}
+#[test]
+fn adopts_hidden_owned_qt_surface_before_showing_video() {
+    check_embedding("qt-pending", true);
+}
+fn check_embedding(mode: &str, public: bool) {
+    let mut child = Fixture::spawn(mode);
     let pid = child.0.id();
     let deadline = Instant::now() + Duration::from_secs(6);
     let video = loop {
-        if let Some((h, _)) = find_video(pid).unwrap() {
+        if let Some((h, _)) = find_owned_video(pid, public).unwrap() {
             break h;
         }
         assert!(
@@ -179,6 +204,8 @@ fn embeds_a_separate_process_only_in_its_video_area_and_restores_it() {
         thread::sleep(Duration::from_millis(30));
     };
     assert!(find_video(u32::MAX).unwrap().is_none());
+    assert!(find_owned_video(u32::MAX, public).unwrap().is_none());
+    assert!(!matches_owned(video, std::process::id(), public));
     let host = Host(unsafe {
         CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -200,6 +227,7 @@ fn embeds_a_separate_process_only_in_its_video_area_and_restores_it() {
     let original_ex = style_bits(video, GWL_EXSTYLE);
     let original_rect = window_rect(video);
     let mut pane = PlayerSurface::new(host.0 .0 as isize);
+    pane.set_public_runtime(public);
     assert!(
         pane.tick(pid, true, Some((30, 40, 320, 180)), 1.).embedded,
         "{:?}",
@@ -222,16 +250,20 @@ fn embeds_a_separate_process_only_in_its_video_area_and_restores_it() {
     assert_ne!(style_bits(video, GWL_STYLE) & WS_VISIBLE.0, 0);
     assert_eq!(relative_rect(host.0, video), (6, 7, 250, 140));
     // The restored top-level window remains independent on subsequent frames.
-    pane.set_native_window(true);
-    for _ in 0..2 {
-        let s = pane.tick(pid, true, Some((6, 7, 250, 140)), 0.7);
-        assert!(s.native_window && !s.embedded);
-        assert!(parent_of(video).is_invalid());
-        assert_eq!(style_bits(video, GWL_STYLE) & WS_CHILD.0, 0);
-        assert_eq!(pid_of(unsafe { GetAncestor(video, GA_ROOT) }), pid);
+    // The synthetic pending fixture must not put a real independent window on
+    // the desktop. Its hidden state is checked again below after detaching.
+    if mode != "qt-pending" {
+        pane.set_native_window(true);
+        for _ in 0..2 {
+            let s = pane.tick(pid, true, Some((6, 7, 250, 140)), 0.7);
+            assert!(s.native_window && !s.embedded);
+            assert!(parent_of(video).is_invalid());
+            assert_eq!(style_bits(video, GWL_STYLE) & WS_CHILD.0, 0);
+            assert_eq!(pid_of(unsafe { GetAncestor(video, GA_ROOT) }), pid);
+        }
+        pane.set_native_window(false);
+        assert!(pane.tick(pid, true, Some((6, 7, 250, 140)), 1.).embedded);
     }
-    pane.set_native_window(false);
-    assert!(pane.tick(pid, true, Some((6, 7, 250, 140)), 1.).embedded);
     assert!(!pane.tick(0, false, None, 1.).embedded);
     assert!(parent_of(video).is_invalid());
     assert_eq!(style_bits(video, GWL_STYLE), original_style);

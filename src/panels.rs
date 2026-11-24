@@ -52,6 +52,9 @@ fn busy(s: &Value) -> bool {
 fn can_play(s: &Value) -> bool {
     !busy(s) && s["ready"].as_bool() == Some(true)
 }
+fn state_supports(s: &Value, key: &str) -> bool {
+    s["publicRuntime"] != true || crate::chiaki_ui::supported_setting(key)
+}
 // JavaScript normalizes numbers when serializing a settings acknowledgement (1.0 → 1).
 // All numeric settings are small bounded values; compare their value, not their JSON spelling.
 fn setting_matches(saved: Option<&Value>, edited: &Value) -> bool {
@@ -279,6 +282,30 @@ fn measured_mode(v: &Value, w: &str, h: &str, rate: &str, unit: &str) -> Option<
     }
     Some(mode)
 }
+fn frame_generation_status(stats: &Value) -> Option<String> {
+    let raw = stats["frameGeneration"].as_str()?;
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "off" {
+        return Some("关闭".into());
+    }
+    let backend = match raw {
+        "dlssg" | "1" => "DLSS（Vulkan）",
+        "fsr" | "2" => "AMD FSR 补帧",
+        "flow" | "3" => "光流补帧",
+        "nvidia-vfg" | "4" => "NVIDIA 视频补帧",
+        "dlssg-dx12" | "5" => "DLSS（D3D12）",
+        _ => return Some(format!("引擎未识别的补帧状态：{raw}")),
+    };
+    let multiple = stats["frameGenerationMultiplier"]
+        .as_f64()
+        .filter(|n| n.is_finite() && *n > 1.);
+    Some(match multiple {
+        Some(n) => format!("{backend} · {n}×"),
+        None => format!("{backend}（未回报有效倍率）"),
+    })
+}
 fn nr_reason(reason: &str) -> String {
     let label = match reason {
         "driver-fault" => "驱动触发引擎保护",
@@ -496,9 +523,27 @@ impl Panels {
         ui.spacing_mut().item_spacing = egui::vec2(8., 6.);
         ui.push_id(tab, |ui| match tab {
             Tab::Connect => self.connect(ui, state, &mut out),
-            Tab::Capture => self.capture(ui, state, &mut out),
+            Tab::Capture => {
+                if state["publicRuntime"] == true {
+                    note(
+                        ui,
+                        "通过 DirectShow 获取采集画面；选择实际连接的视频设备后预览。",
+                    );
+                }
+                ui.add_enabled_ui(true, |ui| self.capture(ui, state, &mut out));
+            }
             Tab::Picture => self.picture(ui, state, &mut out),
-            Tab::Controls => self.controls(ui, state, &mut out),
+            Tab::Controls => {
+                if state["publicRuntime"] == true {
+                    note(
+                        ui,
+                        "USB DualSense 使用原生 HID、后台输入与体感修正。以下扩展操作尚未接入。",
+                    );
+                }
+                ui.add_enabled_ui(state["publicRuntime"] != true, |ui| {
+                    self.controls(ui, state, &mut out)
+                });
+            }
             Tab::Diagnostics => self.diagnostics(ui, state),
         });
         out
@@ -557,23 +602,28 @@ impl Panels {
         } else {
             cur.as_str().unwrap_or("").to_string()
         };
-        row(ui, label, |ui| {
-            if let Some(v) = choose(ui, k, &text, &literal_options(opts), "请选择") {
-                self.stage(
-                    s,
-                    k,
-                    if numeric {
-                        json!(v.parse::<i64>().unwrap_or(0))
-                    } else {
-                        Value::String(v)
-                    },
-                );
-            }
+        ui.add_enabled_ui(state_supports(s, k), |ui| {
+            row(ui, label, |ui| {
+                if let Some(v) = choose(ui, k, &text, &literal_options(opts), "请选择") {
+                    self.stage(
+                        s,
+                        k,
+                        if numeric {
+                            json!(v.parse::<i64>().unwrap_or(0))
+                        } else {
+                            Value::String(v)
+                        },
+                    );
+                }
+            })
         });
     }
     fn check(&mut self, ui: &mut Ui, s: &Value, k: &str, label: &str) {
         let mut v = self.get(s, k).as_bool().unwrap_or(false);
-        if ui.checkbox(&mut v, label).changed() {
+        if ui
+            .add_enabled(state_supports(s, k), egui::Checkbox::new(&mut v, label))
+            .changed()
+        {
             self.stage(s, k, json!(v));
         }
     }
@@ -588,26 +638,28 @@ impl Panels {
         step: f64,
     ) {
         let mut v = self.get(s, k).as_f64().unwrap_or(min);
-        row(ui, label, |ui| {
-            ui.spacing_mut().slider_width = (ui.available_width() - 49.).clamp(40., 220.);
-            if ui
-                .add(
-                    egui::Slider::new(&mut v, min..=max)
-                        .step_by(step)
-                        .max_decimals(if step == 1. { 0 } else { 2 }),
-                )
-                .changed()
-            {
-                self.stage(
-                    s,
-                    k,
-                    if step == 1. {
-                        json!(v.round() as i64)
-                    } else {
-                        json!((v * 100.).round() / 100.)
-                    },
-                );
-            }
+        ui.add_enabled_ui(state_supports(s, k), |ui| {
+            row(ui, label, |ui| {
+                ui.spacing_mut().slider_width = (ui.available_width() - 49.).clamp(40., 220.);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut v, min..=max)
+                            .step_by(step)
+                            .max_decimals(if step == 1. { 0 } else { 2 }),
+                    )
+                    .changed()
+                {
+                    self.stage(
+                        s,
+                        k,
+                        if step == 1. {
+                            json!(v.round() as i64)
+                        } else {
+                            json!((v * 100.).round() / 100.)
+                        },
+                    );
+                }
+            })
         });
     }
     fn number(
@@ -625,18 +677,20 @@ impl Panels {
             .get(s, k)
             .as_i64()
             .unwrap_or_else(|| self.get(s, k).as_f64().unwrap_or(0.) as i64);
-        row(ui, label, |ui| {
-            if ui
-                .add(
-                    egui::DragValue::new(&mut v)
-                        .range(min..=max)
-                        .speed(speed)
-                        .suffix(unit),
-                )
-                .changed()
-            {
-                self.stage(s, k, json!(v));
-            }
+        ui.add_enabled_ui(state_supports(s, k), |ui| {
+            row(ui, label, |ui| {
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v)
+                            .range(min..=max)
+                            .speed(speed)
+                            .suffix(unit),
+                    )
+                    .changed()
+                {
+                    self.stage(s, k, json!(v));
+                }
+            })
         });
     }
     fn bitrate(&mut self, ui: &mut Ui, s: &Value) -> egui::Response {
@@ -672,6 +726,9 @@ impl Panels {
         response
     }
     fn connect(&mut self, ui: &mut Ui, s: &Value, out: &mut Actions) {
+        if let Some(message) = s["connectionError"].as_str() {
+            note(ui, message);
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.remote_tab, false, "局域网");
             ui.selectable_value(&mut self.remote_tab, true, "PSN 异地");
@@ -930,6 +987,12 @@ impl Panels {
         Ok(args)
     }
     fn remote(&mut self, ui: &mut Ui, s: &Value, out: &mut Actions) {
+        if s["publicRuntime"] == true {
+            note(
+                ui,
+                "当前支持 Sony 浏览器授权后进行局域网配对；PSN 异地穿透尚未接入。",
+            );
+        }
         title(ui, "PlayStation 账号");
         let acct = &s["account"];
         if acct.is_object() {
@@ -947,7 +1010,14 @@ impl Panels {
                 self.signout_prompt = !self.signout_prompt;
             }
             if self.signout_prompt {
-                note(ui, "退出会断开当前会话并清除本地 PSN 授权。");
+                note(
+                    ui,
+                    if s["publicRuntime"] == true {
+                        "退出会清除本地账号身份；已配对主机保留。"
+                    } else {
+                        "退出会断开当前会话并清除本地 PSN 授权。"
+                    },
+                );
                 ui.horizontal(|ui| {
                     if btn(ui, "确认退出", !busy(s)) {
                         cmd(out, "sign-out", json!({}));
@@ -964,9 +1034,9 @@ impl Panels {
                 "在 Sony 页面登录，再将 Remote Play 回跳网址粘贴到下方。",
             );
             self.browser_auth(ui, s, out, false);
-            egui::CollapsingHeader::new("需要自动读取账号的主机列表？").id_salt("credential-options").show(ui,|ui|{
+            ui.add_enabled_ui(s["publicRuntime"] != true,|ui|egui::CollapsingHeader::new("需要自动读取账号的主机列表？").id_salt("credential-options").show(ui,|ui|{
                 note(ui,"Sony 登录后，可使用 Sony 返回的 npsso 代替回跳网址；回跳授权可直接填写 DUID。");if btn(ui,"打开 Sony 凭据页面",can_play(s)){cmd(out,"open-cookie",json!({}));}
-            });
+            }));
         }
         divider(ui);
         title(ui, "远程主机");
@@ -1238,10 +1308,13 @@ impl Panels {
         self.apply(ui, Tab::Capture, s, out);
     }
     fn picture(&mut self, ui: &mut Ui, s: &Value, out: &mut Actions) {
+        if s["publicRuntime"] == true {
+            note(ui,"画质、超分与补帧通过渲染通道应用；串流参数修改后自动重连。实际效果以运行状态回报为准。");
+        }
         title(ui, "画面风格");
         ui.horizontal_wrapped(|ui| {
             for (key, label) in [(0, "原样"), (1, "鲜艳"), (2, "电影"), (3, "竞技")] {
-                if ui.button(label).clicked() {
+                if ui.add(egui::Button::new(label)).clicked() {
                     let values = match key {
                         1 => [1.0, 1.06, 1., 0.5, 0., 0.3, 0., 0.],
                         2 => [0.95, 1.08, 1., 0.2, 0., 0., 0.3, 0.3],
@@ -1378,7 +1451,7 @@ impl Panels {
         let capable = gpu["dlssNrSupported"].as_bool() == Some(true);
         if ui
             .add_enabled(
-                can_play(s) && (capable || nr),
+                can_play(s) && (s["publicRuntime"] == true || capable || nr),
                 egui::Checkbox::new(&mut nr, "启用 DLSS 5 NR"),
             )
             .changed()
@@ -1388,6 +1461,11 @@ impl Panels {
         let blocker = strval(gpu, "nrUnavailableReason").trim();
         if !blocker.is_empty() {
             note(ui, nr_reason(blocker));
+        } else if s["publicRuntime"] == true {
+            note(
+                ui,
+                "需要兼容的 RTX 显卡与驱动；准备组件不代表 NR 已实际处理视频帧。",
+            );
         } else if !capable {
             note(
                 ui,
@@ -1445,6 +1523,12 @@ impl Panels {
             &[("off", "关闭"), ("smart", "智能"), ("strict", "严格")],
         );
         self.check(ui, s, "neuralRenderingColorPreserve", "保留原始色彩");
+        if s["publicRuntime"] == true {
+            note(
+                ui,
+                "当前 NR 模型未提供 HUD 保护与原色保留接口，这两项暂不可用。",
+            );
+        }
         divider(ui);
         egui::CollapsingHeader::new("串流画质与画面来源").show(ui, |ui| {
             self.setting_choice(
@@ -1498,6 +1582,12 @@ impl Panels {
                 ],
             );
             self.number(ui, s, "fecRatioPercent", "纠错冗余", 0, 50, 1., " %");
+            if s["publicRuntime"] == true {
+                note(
+                    ui,
+                    "纠错冗余由串流协议管理；当前后端未开放手动冗余与自动恢复码率接口。",
+                );
+            }
             let locked = self.get(s, "lockBitrate").as_bool().unwrap_or(false);
             ui.add_enabled_ui(!locked, |ui| {
                 self.check(ui, s, "adaptiveBitrateRestoration", "自动恢复码率");
@@ -1507,6 +1597,9 @@ impl Panels {
             }
             self.check(ui, s, "hdr", "请求 HDR");
             self.check(ui, s, "autoHdr", "自动 HDR");
+            if s["publicRuntime"] == true {
+                note(ui, "HDR 请使用“请求 HDR”；系统自动 HDR 检测暂不可用。");
+            }
             self.setting_choice(
                 ui,
                 s,
@@ -1522,6 +1615,28 @@ impl Panels {
         });
         egui::CollapsingHeader::new("补帧").show(ui, |ui| {
             self.check(ui, s, "frameGeneration", "启用帧生成");
+            if s["publicRuntime"] == true && playing(s) {
+                let stats = live_stats(&s["status"]);
+                if let Some(n) = stats["frameGenerationMultiplier"]
+                    .as_u64()
+                    .filter(|n| *n > 1)
+                {
+                    note(
+                        ui,
+                        format!(
+                            "实际补帧：{n}× · {}",
+                            strval(stats, "frameGenerationBackend")
+                        ),
+                    );
+                } else if !strval(stats, "frameGenerationReason").is_empty() {
+                    note(ui, strval(stats, "frameGenerationReason"));
+                } else if self.get(s, "frameGeneration") == true {
+                    note(
+                        ui,
+                        "等待补帧引擎处理新画面；60 fps 源输入通常需要至少 120 Hz 显示器。",
+                    );
+                }
+            }
             self.setting_choice(
                 ui,
                 s,
@@ -1530,7 +1645,7 @@ impl Panels {
                 &[
                     ("dlssg", "DLSS 帧生成"),
                     ("nvidia", "NVIDIA 视频补帧"),
-                    ("warp", "轻量 Warp"),
+                    ("warp", "光流补帧"),
                 ],
             );
             self.setting_choice(
@@ -1551,6 +1666,9 @@ impl Panels {
                     ("60-to-30", "60 → 30 后补帧"),
                 ],
             );
+            if s["publicRuntime"] == true {
+                note(ui, "倍率以去重后的源画面为基准；重复帧识别不会自动提高所选倍率，显示刷新率不足时会降低实际输出。");
+            }
         });
         self.apply(ui, Tab::Picture, s, out);
     }
@@ -1621,7 +1739,11 @@ impl Panels {
         let gpu = &s["gpu"];
         title(ui, "引擎与显示");
         row(ui, "显卡", |ui| {
-            ui.label(gpu["adapterName"].as_str().unwrap_or("等待引擎"));
+            ui.label(gpu["adapterName"].as_str().unwrap_or(if playing(s) {
+                "渲染器尚未回报显卡信息"
+            } else {
+                "连接后读取渲染显卡"
+            }));
         });
         row(ui, "驱动", |ui| {
             ui.label(short_stat(&gpu["driverVersion"]));
@@ -1632,18 +1754,33 @@ impl Panels {
             });
         }
         row(ui, "NR 硬件支持", |ui| {
-            let raw = gpu.get("dlssNrReported").unwrap_or(&gpu["dlssNrSupported"]);
-            ui.label(match raw.as_bool() {
+            let raw = gpu["dlssNrReported"].as_bool().or_else(|| {
+                strval(gpu, "nrProbeState")
+                    .is_empty()
+                    .then(|| gpu["dlssNrSupported"].as_bool())
+                    .flatten()
+            });
+            ui.label(match raw {
                 Some(true) => "支持",
                 Some(false) => "未报告支持",
-                None => "未探测",
+                None => match strval(gpu, "nrProbeState") {
+                    "failed" => "组件初始化失败，未确认",
+                    "not-compiled" => "当前组件不支持",
+                    "preparing" => "正在验证",
+                    "not-probed" => "启用 NR 后验证",
+                    _ => "等待能力回报",
+                },
             });
         });
         row(ui, "NR 当前可用", |ui| {
             ui.label(match gpu["dlssNrSupported"].as_bool() {
                 Some(true) => "可启用",
                 Some(false) => "不可启用",
-                None => "待探测",
+                None => match strval(gpu, "nrProbeState") {
+                    "preparing" => "正在准备",
+                    "not-probed" => "尚未启用验证",
+                    _ => "等待能力回报",
+                },
             });
         });
         let blocker = strval(gpu, "nrUnavailableReason").trim();
@@ -1658,6 +1795,12 @@ impl Panels {
             }
         }
         if playing(s) {
+            if st["telemetryStale"] == true {
+                note(
+                    ui,
+                    "运行状态更新已中断，等待渲染器重新回报；暂不显示旧会话指标。",
+                );
+            }
             let (source, capture) = session_source(st, stats);
             if let Some(message) = bitrate_lock_message(&st["renderFeedback"]["bitrateLock"]) {
                 note(ui, message);
@@ -1714,6 +1857,17 @@ impl Panels {
                     ui.label(nr_reason(nr_note));
                 });
             }
+            if let Some(value) = frame_generation_status(stats) {
+                row(ui, "实际补帧", |ui| {
+                    ui.label(value);
+                });
+            }
+            let fg_reason = strval(stats, "frameGenerationReason").trim();
+            if !fg_reason.is_empty() {
+                row(ui, "补帧状态原因", |ui| {
+                    ui.label(fg_reason);
+                });
+            }
             let nr_guard = &st["renderFeedback"]["nrGuard"];
             if matches!(strval(nr_guard, "state"), "suspended" | "error")
                 && !strval(nr_guard, "reason").is_empty()
@@ -1725,12 +1879,14 @@ impl Panels {
             for (key, label, unit) in [
                 ("decodeMs", "解码延迟", " ms"),
                 ("renderMs", "渲染延迟", " ms"),
+                ("renderSubmitMs", "渲染提交耗时", " ms"),
                 ("netRttMs", "网络往返", " ms"),
+                ("netProbeRttMs", "连接探测往返", " ms"),
                 ("lossPct", "丢包率", " %"),
                 ("bitrateKbps", "输入码率", ""),
                 ("activeUpscaler", "实际超分", ""),
                 ("neuralRenderingMs", "NR 处理耗时", " ms"),
-                ("frameGeneration", "实际补帧", ""),
+                ("framesLost", "累计丢失视频帧", ""),
                 ("captureState", "采集状态", ""),
                 ("captureAudioActive", "采集音频", ""),
                 ("controllerSummary", "手柄", ""),
@@ -1745,6 +1901,25 @@ impl Panels {
                                 .unwrap_or_else(|| short_stat(&stats[key]))
                         } else if key == "activeUpscaler" {
                             upscaler_name(strval(stats, key)).to_owned()
+                        } else if key == "captureState" {
+                            match strval(stats, key) {
+                                "opening" => "正在打开",
+                                "active" => "正在采集",
+                                "stalled" => "采集输入中断",
+                                "error" => "采集失败",
+                                "stopped" => "已停止",
+                                other => other,
+                            }
+                            .to_owned()
+                        } else if key == "captureAudioActive" && stats[key] == false {
+                            "未接入".to_owned()
+                        } else if let Some(n) = stats[key].as_f64() {
+                            format!(
+                                "{}{unit}",
+                                format!("{n:.2}")
+                                    .trim_end_matches('0')
+                                    .trim_end_matches('.')
+                            )
                         } else {
                             format!("{}{unit}", short_stat(&stats[key]))
                         };
@@ -2150,6 +2325,47 @@ mod tests {
         s["status"]["stats"]["pictureSource"] = json!("capture");
         let v = draw_panel(&ctx, &mut p, Tab::Diagnostics, &s, vec![]).0;
         assert!(text_labels(&v).contains(&"采集卡画面 + 网络控制"));
+    }
+    #[test]
+    fn diagnostics_show_renderer_capabilities_and_named_frame_generation() {
+        let ctx = egui::Context::default();
+        let mut panels = Panels::default();
+        let mut state = json!({"status":{"phase":"streaming","stats":{
+            "width":1920,"height":1080,"fps":59.94,"outputWidth":3840,"outputHeight":2160,"outputFps":118.25,
+            "pictureSource":"stream","frameGeneration":"dlssg-dx12","frameGenerationMultiplier":2,
+            "bitrateKbps":83750,"neuralRendering":"on","renderSubmitMs":3.12,"netProbeRttMs":1.5}},
+            "gpu":{"adapterName":"Test GPU","driverVersion":"test-driver","dlssNrReported":true,
+                "dlssNrSupported":true,"displayWidth":3840,"displayHeight":2160,"displayHz":144},
+            "settings":{"neuralRendering":true}});
+        let output = draw_panel(&ctx, &mut panels, Tab::Diagnostics, &state, vec![]).0;
+        let labels = text_labels(&output);
+        for expected in [
+            "Test GPU",
+            "test-driver",
+            "支持",
+            "可启用",
+            "网络串流",
+            "DLSS（D3D12） · 2×",
+            "83.75 Mbps",
+            "3840 × 2160 · 118.25 fps",
+            "3840 × 2160 · 144 Hz",
+            "连接探测往返",
+            "渲染提交耗时",
+        ] {
+            assert!(labels.contains(&expected), "missing {expected}: {labels:?}");
+        }
+        assert!(!labels.contains(&"5") && !labels.contains(&"正在识别"));
+        state["gpu"]["dlssNrSupported"] = json!(false);
+        state["gpu"]["nrUnavailableReason"] = json!("NR 初始化失败");
+        state["status"]["stats"]["neuralRendering"] = json!("unavailable");
+        let output = draw_panel(&ctx, &mut panels, Tab::Diagnostics, &state, vec![]).0;
+        let labels = text_labels(&output);
+        assert!(
+            labels.contains(&"支持")
+                && labels.contains(&"不可启用")
+                && labels.contains(&"NR 初始化失败")
+        );
+        assert!(!labels.contains(&"生效"));
     }
     #[test]
     fn opening_each_view_does_not_start_camera_or_network_and_nr_follows_shared_state() {

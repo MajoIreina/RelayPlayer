@@ -67,6 +67,29 @@ fn matches_class(window: HWND) -> bool {
             .copied()
             .eq(PLAYBACK_CLASS.encode_utf16())
 }
+fn matches_public_class(window: HWND) -> bool {
+    let mut name = [0u16; 128];
+    let len = unsafe { GetClassNameW(window, &mut name) };
+    let class = String::from_utf16_lossy(&name[..len.max(0) as usize]);
+    // Qt's generated suffix varies with version/build. Pair this with the
+    // verified child PID and an unowned top-level window, never title matching.
+    class.starts_with("Qt") && class.ends_with("QWindowIcon")
+}
+fn matches_owned(window: HWND, pid: u32, public: bool) -> bool {
+    if !public {
+        return matches_target(window, pid);
+    }
+    !window.is_invalid()
+        && pid > 0
+        && unsafe { IsWindow(window).as_bool() }
+        && pid_of(window) == pid
+        && matches_public_class(window)
+}
+fn ready_for_handoff(window: HWND, pid: u32) -> bool {
+    unsafe {
+        GetPropW(window, windows::core::w!("RelayPlayer.VideoReady.V1")).0 as usize == pid as usize
+    }
+}
 fn matches_target(window: HWND, pid: u32) -> bool {
     !window.is_invalid()
         && unsafe { IsWindow(window).as_bool() }
@@ -76,6 +99,7 @@ fn matches_target(window: HWND, pid: u32) -> bool {
 }
 struct Search {
     pid: u32,
+    public: bool,
     result: Option<(HWND, u32)>,
 }
 unsafe extern "system" fn enum_window(window: HWND, cookie: LPARAM) -> BOOL {
@@ -84,8 +108,9 @@ unsafe extern "system" fn enum_window(window: HWND, cookie: LPARAM) -> BOOL {
     let pid = pid_of(window);
     if pid == 0
         || pid != search.pid
-        || !matches_class(window)
-        || !unsafe { IsWindowVisible(window).as_bool() }
+        || !matches_owned(window, search.pid, search.public)
+        || (!unsafe { IsWindowVisible(window).as_bool() }
+            && !(search.public && ready_for_handoff(window, pid)))
         || style_bits(window, GWL_STYLE) & WS_CHILD.0 != 0
         || unsafe { GetWindow(window, GW_OWNER) }.is_ok()
     {
@@ -96,8 +121,16 @@ unsafe extern "system" fn enum_window(window: HWND, cookie: LPARAM) -> BOOL {
     }
     BOOL(1)
 }
+#[cfg(test)]
 fn find_video(pid: u32) -> WinResult<Option<(HWND, u32)>> {
-    let mut search = Search { pid, result: None };
+    find_owned_video(pid, false)
+}
+fn find_owned_video(pid: u32, public: bool) -> WinResult<Option<(HWND, u32)>> {
+    let mut search = Search {
+        pid,
+        public,
+        result: None,
+    };
     unsafe {
         EnumWindows(
             Some(enum_window),
@@ -147,6 +180,7 @@ fn embedded_ex_style(original: u32) -> u32 {
 struct Attached {
     hwnd: HWND,
     pid: u32,
+    public: bool,
     style: u32,
     ex_style: u32,
     placement: WINDOWPLACEMENT,
@@ -155,8 +189,13 @@ struct Attached {
     hidden: bool,
 }
 impl Attached {
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn attach(host: HWND, window: HWND, pid: u32) -> WinResult<Self> {
-        if !matches_target(window, pid) || !parent_of(window).is_invalid() {
+        Self::attach_owned(host, window, pid, false)
+    }
+    fn attach_owned(host: HWND, window: HWND, pid: u32, public: bool) -> WinResult<Self> {
+        if !matches_owned(window, pid, public) || !parent_of(window).is_invalid() {
             return Err(windows::core::Error::from_win32());
         }
         let mut placement = WINDOWPLACEMENT {
@@ -171,6 +210,7 @@ impl Attached {
         let item = Self {
             hwnd: window,
             pid,
+            public,
             style: style_bits(window, GWL_STYLE),
             ex_style: style_bits(window, GWL_EXSTYLE),
             placement,
@@ -239,11 +279,17 @@ impl Attached {
         Ok(())
     }
     fn restore(self, host: HWND) {
-        if !matches_target(self.hwnd, self.pid) || parent_of(self.hwnd) != host {
+        if !matches_owned(self.hwnd, self.pid, self.public) || parent_of(self.hwnd) != host {
             return;
         }
         // Detaching one of our engine's windows must not disrupt a different HWND
         // reused by Windows. Never destroy foreign-owned handles or run code in the child.
+        let originally_hidden = self.style & WS_VISIBLE.0 == 0;
+        if originally_hidden {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
         if reparent(self.hwnd, HWND::default()).is_err() {
             return;
         }
@@ -257,9 +303,21 @@ impl Attached {
                 self.rect.top,
                 self.rect.right - self.rect.left,
                 self.rect.bottom - self.rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+                SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_NOOWNERZORDER
+                    | SWP_FRAMECHANGED
+                    | if originally_hidden {
+                        SWP_HIDEWINDOW
+                    } else {
+                        SET_WINDOW_POS_FLAGS(0)
+                    },
             );
-            let _ = SetWindowPlacement(self.hwnd, &self.placement);
+            // GetWindowPlacement reports SW_SHOWNORMAL for a window that has
+            // never been shown. Applying it would flash a native top-level.
+            if !originally_hidden {
+                let _ = SetWindowPlacement(self.hwnd, &self.placement);
+            }
         }
     }
 }
@@ -448,6 +506,7 @@ pub struct PlayerSurface {
     attached: Option<Attached>,
     last_search: Option<Instant>,
     native_mode: bool,
+    public: bool,
     external: Option<(HWND, u32)>,
     clip_added: bool,
     last_audio: Option<AudioTarget>,
@@ -471,6 +530,7 @@ impl PlayerSurface {
             attached: None,
             last_search: None,
             native_mode: false,
+            public: false,
             external: None,
             clip_added: false,
             last_audio: None,
@@ -508,6 +568,30 @@ impl PlayerSurface {
             self.last_search = None;
             self.status.native_window = false;
             self.native_mode = enabled;
+        }
+    }
+    pub fn set_public_runtime(&mut self, enabled: bool) {
+        if self.public != enabled {
+            self.detach();
+            self.external = None;
+            self.last_search = None;
+            self.public = enabled;
+        }
+    }
+    pub fn release_video(&mut self) {
+        self.detach();
+        self.last_search = None;
+    }
+    pub fn hide_video(&mut self) {
+        if let Some(child) = &mut self.attached {
+            let _ = child.place(None);
+        }
+        if let Some((window, pid)) = self.external {
+            if matches_owned(window, pid, self.public) {
+                unsafe {
+                    let _ = ShowWindowAsync(window, SW_HIDE);
+                }
+            }
         }
     }
     fn clipped(&self, rect: Option<PixelRect>) -> Option<PixelRect> {
@@ -549,7 +633,7 @@ impl PlayerSurface {
             self.detach();
             self.external = self.external.filter(|(h, p)| {
                 *p == backend_pid
-                    && matches_target(*h, *p)
+                    && matches_owned(*h, *p, self.public)
                     && style_bits(*h, GWL_STYLE) & WS_CHILD.0 == 0
             });
             if self.external.is_none()
@@ -558,7 +642,30 @@ impl PlayerSurface {
                     .is_none_or(|t| t.elapsed() >= Duration::from_millis(350))
             {
                 self.last_search = Some(Instant::now());
-                self.external = find_video(backend_pid).ok().flatten();
+                self.external = find_owned_video(backend_pid, self.public).ok().flatten();
+                if let Some((window, pid)) = self.external {
+                    if self.public && ready_for_handoff(window, pid) {
+                        // Independent mode still uses Relay's settings. Its window
+                        // is shown only after the same owned-PID handoff check.
+                        let normal =
+                            (style_bits(window, GWL_STYLE) & !WS_POPUP.0) | WS_OVERLAPPEDWINDOW.0;
+                        let _ = set_style(window, GWL_STYLE, normal);
+                        unsafe {
+                            let _ = SetWindowPos(
+                                window,
+                                HWND_TOP,
+                                100,
+                                100,
+                                1280,
+                                720,
+                                SWP_NOACTIVATE
+                                    | SWP_NOOWNERZORDER
+                                    | SWP_FRAMECHANGED
+                                    | SWP_SHOWWINDOW,
+                            );
+                        }
+                    }
+                }
             }
             self.status.native_window = self.external.is_some();
             self.status.video_message = if self.status.native_window {
@@ -569,7 +676,7 @@ impl PlayerSurface {
             .into();
         } else {
             if self.attached.as_ref().is_some_and(|v| {
-                !matches_target(v.hwnd, v.pid)
+                !matches_owned(v.hwnd, v.pid, self.public)
                     || v.pid != backend_pid
                     || parent_of(v.hwnd) != self.host
             }) {
@@ -582,7 +689,7 @@ impl PlayerSurface {
                     .is_none_or(|i| i.elapsed() >= Duration::from_millis(350))
             {
                 self.last_search = Some(Instant::now());
-                match find_video(backend_pid) {
+                match find_owned_video(backend_pid, self.public) {
                     Ok(Some((hwnd, pid))) => {
                         let host_style = style_bits(self.host, GWL_STYLE);
                         if host_style & WS_CLIPCHILDREN.0 == 0
@@ -591,7 +698,7 @@ impl PlayerSurface {
                         {
                             self.clip_added = true;
                         }
-                        match Attached::attach(self.host, hwnd, pid) {
+                        match Attached::attach_owned(self.host, hwnd, pid, self.public) {
                             Ok(child) => self.attached = Some(child),
                             Err(e) => self.status.video_message = format!("无法嵌入引擎画面：{e}"),
                         }

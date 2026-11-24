@@ -3,12 +3,16 @@
 mod backend;
 mod chiaki;
 mod chiaki_ui;
+mod connections;
 mod design;
 mod migration;
 #[cfg(test)]
 mod migration_settings_tests;
 mod panels;
 mod platform;
+#[allow(dead_code)]
+#[path = "playback.rs"]
+mod playback;
 use backend::{Backend, BackendEvent};
 use design::*;
 use egui::{
@@ -151,6 +155,8 @@ struct Relay {
     install_root: PathBuf,
     profile_root: PathBuf,
     backend: Option<Backend>,
+    public: Option<chiaki_ui::PublicPlayback>,
+    close_after_cancel: bool,
     online: bool,
     state: Value,
     unavailable: Option<String>,
@@ -177,22 +183,50 @@ impl Relay {
         };
         let migration_error = startup.import_if_requested().err();
         let prefs = Prefs::load(&startup.profile_root);
-        let (backend, unavailable) =
+        let (backend, unavailable) = if startup.ipc {
             match Backend::spawn(&startup.install_root, &startup.profile_root.join("data")) {
                 Ok(b) => (Some(b), None),
                 Err(e) => (None, Some(e.to_string())),
-            };
+            }
+        } else {
+            (None, None)
+        };
+        let mut public = (!startup.ipc).then(|| {
+            chiaki_ui::PublicPlayback::new(
+                startup.install_root.clone(),
+                startup.profile_root.clone(),
+                startup.custom_data_root,
+                startup.backend_archive,
+            )
+        });
+        if let Some(p) = &mut public {
+            if startup.connect_nr {
+                let _ = p.save(&json!({"neuralRendering":true}));
+            }
+            if startup.connect {
+                if let Err(e) = p.connections.request("discover", json!({})) {
+                    p.note = e.to_string();
+                }
+            }
+        }
+        let online = public.is_some();
+        let state = public.as_ref().map_or(
+            Value::Null,
+            |p| json!({"ready":true,"publicRuntime":true,"settings":p.settings,"status":{"phase":"idle"}}),
+        );
         Self {
             install_root: startup.install_root,
             profile_root: startup.profile_root,
             backend,
-            online: false,
-            state: Value::Null,
+            public,
+            close_after_cancel: false,
+            online,
+            state,
             unavailable,
             hwnd,
             surface: PlayerSurface::new(hwnd),
             panels: Panels::default(),
-            tab: None,
+            tab: startup.connect.then_some(Tab::Connect),
             prefs,
             prefs_changed: None,
             notice: migration_error.map(|e| Notice {
@@ -220,6 +254,55 @@ impl Relay {
         self.last_top = Instant::now();
     }
     fn request(&mut self, name: &str, arg: Value) -> Option<u64> {
+        if self.public.is_some() {
+            if name == "stop" {
+                self.surface.hide_video();
+            }
+            if name == "capture"
+                || (name == "settings"
+                    && arg.as_object().is_some_and(|o| {
+                        o.iter().any(|(k, v)| {
+                            playback::session_key(k)
+                                && self.public.as_ref().unwrap().settings[k] != *v
+                        })
+                    }))
+            {
+                self.surface.release_video();
+            }
+            let p = self.public.as_mut().unwrap();
+            let result = match name {
+                "connect" => p.connect(&arg),
+                "capture" => p.capture(&arg),
+                "devices" => p.devices(),
+                "pin" => p.unlock(&arg),
+                "open-auth" => p
+                    .connections
+                    .authorization_url()
+                    .and_then(|url| open_sony(&url).map_err(std::io::Error::other)),
+                "discover" | "pair" | "sign-in" | "sign-out" | "wake" | "remove" => {
+                    p.connections.request(name, arg)
+                }
+                "settings" => p.save(&arg),
+                "stop" => {
+                    let result = p.stop();
+                    if result.is_ok() {
+                        p.note = "正在断开本次播放……".into();
+                    }
+                    result
+                }
+                _ => Err(std::io::Error::other("当前公开后端尚未接入此操作。")),
+            };
+            let message = match result {
+                Ok(()) => (p.note.clone(), false),
+                Err(e) => (e.to_string(), true),
+            };
+            self.state["settings"] = p.settings.clone();
+            if !message.1 && name == "settings" {
+                self.panels.on_result("settings", &p.settings);
+            }
+            self.message(message.0, message.1);
+            return None;
+        }
         if name == "open-cookie" {
             if let Err(e) = open_sony("https://ca.account.sony.com/api/v1/ssocookie") {
                 self.message(e, true);
@@ -259,6 +342,10 @@ impl Relay {
         }
     }
     fn restart(&mut self) {
+        if self.public.is_some() {
+            self.request("discover", json!({}));
+            return;
+        }
         self.surface.shutdown();
         self.surface = PlayerSurface::new(self.hwnd);
         if let Some(mut b) = self.backend.take() {
@@ -276,6 +363,72 @@ impl Relay {
         }
     }
     fn poll_backend(&mut self) {
+        if let Some(p) = &mut self.public {
+            let old = p.note.clone();
+            let result = p.poll();
+            let connection_event = p.connections.poll();
+            let metadata = p.connections.metadata();
+            self.state["consoles"] = metadata["consoles"].clone();
+            self.state["account"] = metadata["account"].clone();
+            self.state["settings"] = p.settings.clone();
+            // GUI readiness is not a video-frame measurement. Never fabricate
+            // streaming statistics or a positive NR hardware probe.
+            self.state["status"]["phase"] = json!(if p.player.video_received() {
+                "streaming"
+            } else if p.player.stopping() {
+                "disconnecting"
+            } else if p.player.running() {
+                "connecting"
+            } else {
+                "idle"
+            });
+            self.state["operation"] = json!(if p.player.preparing() {
+                "connect"
+            } else {
+                &p.connections.operation
+            });
+            self.state["connectionError"] = json!(p.connections.startup_error);
+            let render_feedback = p.player.render_feedback();
+            self.state["status"]["stats"] = render_feedback["stats"].clone();
+            self.state["gpu"] = render_feedback["stats"]["gpu"].clone();
+            self.state["status"]["telemetryStale"] = render_feedback["telemetryStale"].clone();
+            if render_feedback["pinRequired"]["required"] == true
+                && p.player.running()
+                && !p.player.stopping()
+            {
+                self.state["status"]["phase"] = json!("pin-required");
+            }
+            if render_feedback["devices"]["type"] == "devices" {
+                self.state["devices"] = render_feedback["devices"].clone();
+            }
+            self.state["status"]["renderFeedback"] = p.feedback();
+            if let Some((action, event)) = connection_event {
+                match event {
+                    Ok(value) => {
+                        self.panels.on_result(&action, &value);
+                        let text = match action.as_str() {
+                            "discover" => format!(
+                                "发现 {} 台主机。",
+                                value["consoles"].as_array().map_or(0, Vec::len)
+                            ),
+                            "pair" => "配对已保存，可以开始串流。".into(),
+                            "sign-in" => "Sony 授权已保存，无需手动填写账号 ID。".into(),
+                            "wake" => "已发送唤醒请求。".into(),
+                            "remove" => "已移除本地主机配对。".into(),
+                            _ => "操作已完成。".into(),
+                        };
+                        self.message(text, false);
+                    }
+                    Err(e) => self.message(e, true),
+                }
+            } else if let Err(e) = result {
+                self.message(e.to_string(), true);
+            } else if old != p.note {
+                let note = p.note.clone();
+                self.message(note, false);
+            }
+            return;
+        }
         while let Some(ev) = self.backend.as_ref().and_then(|b| b.try_recv()) {
             match ev {
                 BackendEvent::State(v) => {
@@ -583,7 +736,7 @@ impl Relay {
         let (icon, hint) = if is_active {
             (Icon::Stop, "结束本次播放")
         } else {
-            (Icon::Play, "选择视频来源")
+            (Icon::Play, "连接最近使用的主机")
         };
         let play = command(
             ui,
@@ -600,7 +753,18 @@ impl Relay {
             if is_active {
                 self.request("stop", json!({}));
             } else {
-                self.selected(self.source_intent);
+                let recent = self
+                    .public
+                    .as_ref()
+                    .and_then(|p| p.connections.recent_target());
+                if let Some(target) = recent {
+                    self.source_intent = Tab::Connect;
+                    self.request("connect", target);
+                    self.tab = None;
+                } else {
+                    self.source_intent = Tab::Connect;
+                    self.tab = Some(Tab::Connect);
+                }
             }
         }
         let status = &self.state["status"];
@@ -675,12 +839,22 @@ impl Relay {
         let requested = self.state["settings"]["neuralRendering"]
             .as_bool()
             .unwrap_or(false);
-        let nr = nr_display(&self.state, self.nr_request.is_some());
+        let nr = if let Some(p) = &self.public {
+            if p.player.preparing() {
+                "准备中"
+            } else if p.pending {
+                "待重连"
+            } else {
+                nr_display(&self.state, false)
+            }
+        } else {
+            nr_display(&self.state, self.nr_request.is_some())
+        };
         let capable = self.state["gpu"]["dlssNrSupported"]
             .as_bool()
             .unwrap_or(false);
         let busy = self.nr_request.is_some() || !text_at(&self.state, "operation").is_empty();
-        let can = self.online && (requested || capable) && !busy;
+        let can = self.online && (self.public.is_some() || requested || capable) && !busy;
         let res = ui.interact(
             nrr,
             Id::new("transportNR"),
@@ -750,7 +924,9 @@ impl Relay {
         if res.clicked() && can {
             self.request("settings", json!({"neuralRendering":!requested}));
         }
-        res.on_hover_text(if !capable && !requested {
+        res.on_hover_text(if self.public.is_some() {
+            "选择社区 NR；重新打开连接后应用。实际状态在画面内 RTX 面板查看。"
+        } else if !capable && !requested {
             self.state["gpu"]["nrUnavailableReason"]
                 .as_str()
                 .filter(|s| !s.is_empty())
@@ -885,17 +1061,32 @@ impl Relay {
         );
         let physical = pixel_rect(video, ctx.screen_rect().min, ctx.pixels_per_point());
         // Only the launched process can own a playback window or an audio session.
-        let pid = self.backend.as_ref().map_or(0, Backend::playback_pid);
+        let pid = self.public.as_ref().map_or_else(
+            || self.backend.as_ref().map_or(0, Backend::playback_pid),
+            |p| p.player.playback_pid(),
+        );
         let volume = if self.prefs.muted {
             0.
         } else {
             self.prefs.volume
         };
-        let playing = active(&self.state);
-        self.surface.set_native_window(
-            self.prefs.native_remote_window && !capture_source(&self.state["status"]),
+        let stopping = self.public.as_ref().is_some_and(|p| p.player.stopping());
+        let playing = active(&self.state) || stopping;
+        self.surface.set_public_runtime(self.public.is_some());
+        if !stopping {
+            self.surface.set_native_window(
+                self.prefs.native_remote_window && !capture_source(&self.state["status"]),
+            );
+        }
+        self.surface.tick(
+            pid,
+            playing,
+            if stopping { None } else { Some(physical) },
+            if stopping { 0. } else { volume },
         );
-        self.surface.tick(pid, playing, Some(physical), volume);
+        if stopping {
+            self.surface.hide_video();
+        }
         if !self.surface.status.embedded {
             let mut viewport = ui.new_child(
                 UiBuilder::new()
@@ -1126,7 +1317,19 @@ fn pixel_rect(r: Rect, origin: Pos2, scale: f32) -> (i32, i32, i32, i32) {
 }
 impl eframe::App for Relay {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if let Some(p) = &self.public {
+                if p.player.preparing() {
+                    self.close_after_cancel = true;
+                    p.player.cancel_preparation();
+                    ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                }
+            }
+        }
         self.poll_backend();
+        if self.close_after_cancel && self.public.as_ref().is_some_and(|p| !p.player.preparing()) {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
         self.input(ctx);
         if self
             .notice
@@ -1248,6 +1451,14 @@ impl eframe::App for Relay {
                                     ui.label("需要单独显示串流画面时可启用独立窗口；采集卡画面保持嵌入。实体手柄和后台输入取决于当前播放后端。");
                                     ui.separator();
                                 }
+                                if let Some(p) = &self.public {
+                                    ui.small(&p.note);
+                                    if p.player.preparing() {
+                                        if let Some(progress) = p.progress { ui.add(egui::ProgressBar::new(progress)); }
+                                        if ui.add_enabled(!p.player.cancelling(),egui::Button::new("取消准备")).clicked() { p.player.cancel_preparation(); }
+                                    }
+                                    ui.separator();
+                                }
                                 let out = self.panels.render(ui, tab, &self.state);
                                 if tab == Tab::Diagnostics {
                                     ui.add_space(10.);
@@ -1281,6 +1492,9 @@ impl eframe::App for Relay {
         }));
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(public) = &mut self.public {
+            public.player.shutdown();
+        }
         self.surface.shutdown();
         if let Some(mut worker) = self.backend.take() {
             worker.shutdown();
@@ -1364,6 +1578,7 @@ struct Startup {
     ipc: bool,
     custom_data_root: bool,
     connect: bool,
+    connect_nr: bool,
     backend_archive: Option<PathBuf>,
 }
 impl Startup {
@@ -1376,6 +1591,7 @@ impl Startup {
         let mut import_legacy = false;
         let mut ipc = false;
         let mut connect = false;
+        let mut connect_nr = false;
         let mut backend_archive = None;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -1387,6 +1603,9 @@ impl Startup {
                 import_legacy = !custom_data_root;
             } else if arg == "--connect" {
                 connect = true;
+            } else if arg == "--connect-nr" {
+                connect = true;
+                connect_nr = true;
             } else if arg == "--backend-archive" {
                 let path = args.next().filter(|s| !s.is_empty()).ok_or_else(|| {
                     std::io::Error::new(
@@ -1399,7 +1618,7 @@ impl Startup {
         }
         if ipc && (connect || backend_archive.is_some()) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                "--connect / --backend-archive 适用于 chiaki-ng，不能与 --ipc-backend / --import-legacy 同用。"));
+                "--connect / --connect-nr / --backend-archive 适用于 chiaki-ng，不能与 --ipc-backend / --import-legacy 同用。"));
         }
         let profile_root = match override_root {
             Some(path) if !path.as_os_str().is_empty() => std::path::absolute(path)?,
@@ -1418,6 +1637,7 @@ impl Startup {
             ipc,
             custom_data_root,
             connect,
+            connect_nr,
             backend_archive,
         })
     }
@@ -1460,23 +1680,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Relay · PS5 播放器",
         opt,
         Box::new(move |cc| {
-            if startup.ipc {
-                let app = Relay::new(cc, startup);
-                native_chrome(app.hwnd);
-                Ok(Box::new(app))
-            } else {
-                if let Some(RawWindowHandle::Win32(h)) = cc.window_handle().ok().map(|w| w.as_raw())
-                {
-                    native_chrome(h.hwnd.get());
-                }
-                Ok(Box::new(chiaki_ui::PublicApp::new(
-                    &cc.egui_ctx,
-                    startup.install_root,
-                    startup.custom_data_root.then_some(startup.profile_root),
-                    startup.backend_archive,
-                    startup.connect,
-                )))
-            }
+            let app = Relay::new(cc, startup);
+            native_chrome(app.hwnd);
+            Ok(Box::new(app))
         }),
     )
     .map_err(Into::into)
@@ -1505,9 +1711,12 @@ mod ui_tests {
         assert_eq!(direct.install_root, root);
         assert_eq!(direct.profile_root, profile);
         assert_eq!(direct.backend_archive.as_deref(), Some(zip.as_path()));
+        let nr = Startup::from_options(root.clone(), None, ["--connect-nr".into()]).unwrap();
+        assert!(nr.connect && nr.connect_nr && !nr.ipc);
         for flags in [
             vec!["--connect", "--import-legacy"],
             vec!["--ipc-backend", "--connect"],
+            vec!["--ipc-backend", "--connect-nr"],
             vec!["--backend-archive"],
         ] {
             assert!(
