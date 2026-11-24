@@ -1,4 +1,4 @@
-"""Package the PS5-ready public RelayPlayer release from v0.1.14. Python 3.11+ and Git.
+"""Package the PS5-ready public RelayPlayer release from v0.1.16. Python 3.11+ and Git.
 
 Build RelayPlayer.exe from that tag first. This tool checks its format and
 public interface markers; it does not prove binary build provenance. Source and
@@ -18,16 +18,16 @@ import tempfile
 import tomllib
 import zipfile
 
-VERSION = "0.1.14"
+VERSION = "0.1.16"
 TAG = "v" + VERSION
 HOST = f"RelayPlayer-{VERSION}-windows-x64.zip"
 SOURCE = f"RelayPlayer-{VERSION}-public-source.zip"
 SUMS = "SHA256SUMS.txt"
 DOCS = ("LICENSE", "README.md", "vendor/relay-protocol/LICENSE", "vendor/relay-protocol/README.md", "vendor/relay-protocol/AGPL-3.0-only-OpenSSL.txt", "docs/BACKEND.md", "docs/CHIAKI-PROFILE.md", "docs/patches/dualsense-motion.patch", "docs/releases/v0.1.10.md", "docs/releases/v0.1.9.md", "docs/patches/relay-render/README.md", "docs/patches/relay-render/relay-render.patch", "vendor/artcnn/LICENSE", "vendor/artcnn/README.md",
-        "docs/releases/v0.1.11.md", "docs/releases/v0.1.12.md", "docs/releases/v0.1.13.md", "docs/releases/v0.1.14.md", "notices/CHIAKI-NR.md", "notices/CHIAKI-NG.md", "notices/RUST-THIRD-PARTY.txt", "notices/RUST-STANDARD-LIBRARY.html")
+        "docs/releases/v0.1.11.md", "docs/releases/v0.1.12.md", "docs/releases/v0.1.13.md", "docs/releases/v0.1.14.md", "docs/releases/v0.1.15.md", "docs/releases/v0.1.16.md", "notices/CHIAKI-NR.md", "notices/CHIAKI-NG.md", "notices/RUST-THIRD-PARTY.txt", "notices/RUST-STANDARD-LIBRARY.html")
 SCRIPTS = ("tools/ensure-chiaki.ps1", "tools/Initialize-ChiakiProfile.ps1", "tools/ensure-relay-render.ps1")
 RENDER_SOURCE = ("tools/relay-render-manifest.json", "vendor/artcnn/ArtCNN_C4F16.glsl", "vendor/artcnn/ArtCNN_C4F16_DN.glsl",
-    *("docs/patches/relay-render/"+n for n in ("gui/include/relaycontrol.h","gui/src/relaycontrol.cpp","gui/include/relaycapture.h","gui/src/relaycapture.cpp","gui/include/relayfilters.h","gui/include/relaytelemetry.h","gui/include/relaypolicy.h","gui/src/qml/RelayView.qml")))
+    *("docs/patches/relay-render/"+n for n in ("gui/include/relaycontrol.h","gui/src/relaycontrol.cpp","gui/include/relaycapture.h","gui/src/relaycapture.cpp","gui/include/relayfilters.h","gui/include/relaytelemetry.h","gui/include/relaypolicy.h","gui/include/relayaudio.h","gui/tools/relayaudiotest.cpp","gui/src/qml/RelayView.qml")))
 # These three binary inputs are the reviewed output of tools/make_icon.py.
 ICONS = {
     "assets/relay.ico": "70367948c24a0564c3d74ad35ffbbcb49bc789bbdd93f2a2f8461108af7db4f3",
@@ -39,7 +39,7 @@ FILES = frozenset((".gitattributes", ".gitignore", "Cargo.toml", "Cargo.lock", "
                    *("vendor/relay-protocol/src/" + s + ".rs" for s in ("lib", "base64", "discovery", "error", "http", "random", "regist", "rpcrypt", "rpcrypt/rpcrypt_tables", "sock", "stoppipe", "time")),
                    "tools/make_icon.py", "tools/package_public.py", "tests/test_chiaki_profile.py",
                    "docs/releases/v0.1.7.md", "docs/releases/v0.1.8.md", *DOCS, *SCRIPTS, *RENDER_SOURCE, *ICONS,
-                   *("src/" + s + ".rs" for s in ("backend", "backend_protocol_test", "playback", "chiaki", "chiaki_ui", "connections", "design", "main", "migration",
+                   *("src/" + s + ".rs" for s in ("backend", "backend_protocol_test", "playback", "chiaki", "chiaki_ui", "connections", "wake", "design", "main", "migration",
                      "migration_settings_tests", "panels", "platform", "platform_tests"))))
 DIRS = {"/".join(p.split("/")[:i]) for p in FILES for i in range(1,len(p.split("/")))}
 OID = re.compile(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -253,7 +253,7 @@ def assemble(exe, out, native_overlay):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exe", required=True, type=Path, help="new RelayPlayer.exe built from v0.1.14")
+    parser.add_argument("--exe", required=True, type=Path, help="new RelayPlayer.exe built from v0.1.16")
     parser.add_argument("--out-dir", required=True, type=Path, help="new or empty release output directory")
     parser.add_argument("--native-overlay",type=Path,required=True,help="verified native renderer overlay")
     args = parser.parse_args()

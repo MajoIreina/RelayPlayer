@@ -22,6 +22,7 @@ pub struct PublicPlayback {
     sent_at: Option<std::time::Instant>,
     last_error: String,
     remembered_connection: bool,
+    wake: Option<crate::wake::WakeTask>,
 }
 impl PublicPlayback {
     pub fn new(
@@ -65,9 +66,12 @@ impl PublicPlayback {
             sent_at: None,
             last_error: String::new(),
             remembered_connection: false,
+            wake: None,
         }
     }
     pub fn stop(&mut self) -> io::Result<()> {
+        self.wake = None;
+        self.target = None;
         self.reconnect = false;
         self.capture = false;
         self.devices = false;
@@ -75,7 +79,7 @@ impl PublicPlayback {
         self.changed.clear();
         self.sent_at = None;
         self.player.close()?;
-        self.note = "正在断开本次播放……".into();
+        self.note = "正在结束播放；已连接的 PS5 将进入待机……".into();
         Ok(())
     }
     pub fn feedback(&self) -> Value {
@@ -90,24 +94,31 @@ impl PublicPlayback {
             "bitrateLock":{"state":if self.settings["lockBitrate"]==true{if self.pending{"pending-reconnect"}else{"locked"}}else{"off"},"targetKbps":self.settings["bitrateKbps"]}})
     }
     pub fn connect(&mut self, args: &Value) -> io::Result<()> {
-        if !self.connections.operation.is_empty() {
+        if !self.connections.operation.is_empty()
+            || self.waking()
+            || self.player.preparing()
+            || self.player.running()
+        {
             return Err(io::Error::other("请等待连接操作完成。"));
         }
         let target = self.connections.target(args)?;
+        let wake = crate::wake::WakeTask::start(&target)?;
         self.remembered_connection = false;
         self.last_error.clear();
         self.capture = false;
         self.devices = false;
-        self.player
-            .set_playback_settings(crate::playback::session_settings(&self.settings).to_string())?;
-        self.player.set_render_settings(&self.settings)?;
-        self.player
-            .prepare_stream(self.settings["neuralRendering"] == true)?;
         self.target = Some(target);
-        self.note = "正在检查串流组件……".into();
+        self.wake = Some(wake);
+        self.note = "正在检查主机状态；待机时将自动唤醒……".into();
         Ok(())
     }
+    pub fn waking(&self) -> bool {
+        self.wake.is_some()
+    }
     pub fn capture(&mut self, args: &Value) -> io::Result<()> {
+        if self.waking() {
+            return Err(io::Error::other("请先停止当前主机唤醒。"));
+        }
         let id = args["deviceId"]
             .as_str()
             .ok_or_else(|| io::Error::other("请选择采集设备。"))?;
@@ -124,6 +135,9 @@ impl PublicPlayback {
         Ok(())
     }
     pub fn devices(&mut self) -> io::Result<()> {
+        if self.waking() {
+            return Err(io::Error::other("请先停止当前主机唤醒。"));
+        }
         if self.player.running() {
             return self.player.send_control(&json!({"type":"devices"}));
         }
@@ -171,7 +185,7 @@ impl PublicPlayback {
         self.pending = needs_reconnect;
         if needs_reconnect {
             self.reconnect = true;
-            self.player.close()?;
+            self.player.close_for_reconnect()?;
         }
         self.note = if self.pending {
             "正在重新连接以应用串流参数。"
@@ -182,6 +196,33 @@ impl PublicPlayback {
         Ok(())
     }
     pub fn poll(&mut self) -> io::Result<()> {
+        while let Some(event) = self.wake.as_ref().and_then(|w| w.poll()) {
+            use crate::wake::Event;
+            match event {
+                Event::Checking => self.note = "正在检查主机状态……".into(),
+                Event::Waking => self.note = "已请求网络唤醒，等待 PS5 启动并就绪……".into(),
+                Event::Waiting => self.note = "主机已开机，等待远程游玩服务就绪……".into(),
+                Event::Failed(message) => {
+                    self.wake = None;
+                    self.target = None;
+                    self.progress = None;
+                    self.note = message;
+                }
+                Event::Ready(ip) => {
+                    self.wake = None;
+                    if let Some(target) = &mut self.target {
+                        target["ipAddress"] = json!(ip.to_string());
+                    }
+                    self.player.set_playback_settings(
+                        crate::playback::session_settings(&self.settings).to_string(),
+                    )?;
+                    self.player.set_render_settings(&self.settings)?;
+                    self.player
+                        .prepare_stream(self.settings["neuralRendering"] == true)?;
+                    self.note = "主机已就绪，正在检查串流组件……".into();
+                }
+            }
+        }
         match self.player.poll()? {
             Some(Update::Ready) => {
                 if self.devices || self.capture {
@@ -195,10 +236,11 @@ impl PublicPlayback {
                     self.progress = None;
                     return Ok(());
                 }
-                let target = self
-                    .target
-                    .clone()
-                    .ok_or_else(|| io::Error::other("未选择连接主机。"))?;
+                // Stop may have cancelled preparation just as Ready arrived.
+                // Never start a late session after its target was cleared.
+                let Some(target) = self.target.clone() else {
+                    return Ok(());
+                };
                 self.connections.write_runtime_host(&target)?;
                 self.player.launch_stream(
                     &Connections::runtime_nickname(&target),
@@ -293,6 +335,19 @@ pub fn supported_setting(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_discards_a_late_wakeup_result_before_any_engine_is_prepared() {
+        let root =
+            std::env::temp_dir().join(format!("Relay-Wake-Cancel-QA-{}", std::process::id()));
+        let mut p = PublicPlayback::new(root.clone(), root, true, None);
+        p.target = Some(json!({"hostId":"020000000001","ipAddress":"127.0.0.1"}));
+        p.wake = Some(crate::wake::WakeTask::ready_fixture());
+        assert!(p.waking());
+        p.stop().unwrap();
+        p.poll().unwrap();
+        assert!(!p.waking() && !p.player.preparing() && !p.player.running());
+        assert!(p.target.is_none());
+    }
     #[test]
     fn playback_settings_are_bounded_and_never_accept_credentials_or_fake_algorithms() {
         assert!(valid_setting("bitrateKbps", &json!(200000)));

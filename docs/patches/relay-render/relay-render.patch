@@ -1,5 +1,5 @@
 diff --git a/gui/CMakeLists.txt b/gui/CMakeLists.txt
-index 9cdbe8b..8dc0d5d 100755
+index 9cdbe8b..f543da3 100755
 --- a/gui/CMakeLists.txt
 +++ b/gui/CMakeLists.txt
 @@ -20,6 +20,10 @@ if(WIN32)
@@ -13,7 +13,17 @@ index 9cdbe8b..8dc0d5d 100755
  	include/exception.h
  	src/main.cpp
  	include/discoverymanager.h
-@@ -295,3 +299,6 @@ install(TARGETS chiaki
+@@ -252,6 +256,9 @@ if (${Qt6WebEngineQuick_FOUND})
+ 	target_compile_definitions(chiaki PRIVATE CHIAKI_HAVE_WEBENGINE)
+ endif()
+ target_link_libraries(chiaki SDL2::SDL2)
++add_executable(relay-audio-test EXCLUDE_FROM_ALL tools/relayaudiotest.cpp)
++target_include_directories(relay-audio-test PRIVATE include)
++target_link_libraries(relay-audio-test PRIVATE SDL2::SDL2)
+ if(CHIAKI_ENABLE_SPEEX)
+   target_link_libraries(chiaki PkgConfig::SpeexDSP)
+   target_compile_definitions(chiaki PRIVATE CHIAKI_GUI_ENABLE_SPEEX)
+@@ -295,3 +302,6 @@ install(TARGETS chiaki
  install(FILES chiaking.desktop DESTINATION share/applications)
  install(FILES chiaking.png DESTINATION share/icons/hicolor/512x512/apps)
  install(FILES io.github.streetpea.Chiaki4deck.appdata.xml DESTINATION share/metainfo)
@@ -120,10 +130,28 @@ index ae9bc42..3237d6e 100644
  		ChiakiDisableAudioVideo GetAudioVideoDisabled() const       { return static_cast<ChiakiDisableAudioVideo>(settings.value("settings/audio_video_disabled", 0).toInt()); }
  		void SetAudioVideoDisabled(ChiakiDisableAudioVideo disabled) { settings.setValue("settings/audio_video_disabled", disabled); }
 diff --git a/gui/include/streamsession.h b/gui/include/streamsession.h
-index 840f20e..e585907 100755
+index 840f20e..c59c867 100755
 --- a/gui/include/streamsession.h
 +++ b/gui/include/streamsession.h
-@@ -344,6 +344,7 @@ class StreamSession : public QObject
+@@ -31,6 +31,8 @@
+ #include "sessionlog.h"
+ #include "controllermanager.h"
+ #include "settings.h"
++#include "relayaudio.h"
++#include <QJsonObject>
+ 
+ #include <QObject>
+ #include <QImage>
+@@ -253,6 +255,8 @@ class StreamSession : public QObject
+ 		QString audio_in_device_name;
+ 		SDL_AudioDeviceID audio_out;
+ 		SDL_AudioDeviceID audio_in;
++		bool relay_audio_callback = false;
++		RelayAudioBuffer relay_audio_buffer;
+ 		size_t audio_out_sample_size;
+ 		QMutex audio_out_ring_mutex;
+ 		QByteArray audio_out_ring_buf;
+@@ -344,6 +348,7 @@ class StreamSession : public QObject
  		void GoHome();
  		QString GetHost() { return host; }
  		bool GetConnected() { return connected; }
@@ -131,6 +159,14 @@ index 840f20e..e585907 100755
  		double GetMeasuredBitrate()	{ return measured_bitrate; }
  		double GetAveragePacketLoss()	{ return average_packet_loss; }
  		quint64 DecoderFlushGeneration() const { return decoder_flush_generation.loadRelaxed(); }
+@@ -351,6 +356,7 @@ class StreamSession : public QObject
+ 		bool GetMuted()	{ return muted; }
+ 		void SetMuted(bool enable)	{ if (enable != muted) ToggleMute(); }
+ 		void SetAudioVolume(int volume) { audio_volume = volume; }
++		QJsonObject GetRelayAudioStats() const;
+ 		bool GetCantDisplay()	{ return cant_display; }
+ 		ChiakiErrorCode ConnectPsnConnection(QString duid, bool ps5);
+ 		void CancelPsnConnection(bool stop_thread);
 diff --git a/gui/res/resources.qrc b/gui/res/resources.qrc
 index e922b37..3e150aa 100644
 --- a/gui/res/resources.qrc
@@ -251,7 +287,7 @@ index e05a068..4277ba1 100644
      <file>StreamView.qml</file>
      <file>StreamMenuWindow.qml</file>
 diff --git a/gui/src/qmlbackend.cpp b/gui/src/qmlbackend.cpp
-index 25af475..5f64d6f 100644
+index 25af475..c723382 100644
 --- a/gui/src/qmlbackend.cpp
 +++ b/gui/src/qmlbackend.cpp
 @@ -1,4 +1,6 @@
@@ -261,7 +297,15 @@ index 25af475..5f64d6f 100644
  #include "qmlsettings.h"
  #include "qmlmainwindow.h"
  #include "streamsession.h"
-@@ -718,6 +720,8 @@ bool QmlBackend::discoveryEnabled() const
+@@ -33,6 +35,7 @@
+ #include <QDesktopServices>
+ #include <QtConcurrent>
+ #include <QTimer>
++#include <QPointer>
+ 
+ extern "C" {
+ #include <chiaki/time.h>
+@@ -718,6 +721,8 @@ bool QmlBackend::discoveryEnabled() const
  
  void QmlBackend::setDiscoveryEnabled(bool enabled)
  {
@@ -270,7 +314,7 @@ index 25af475..5f64d6f 100644
      discovery_manager.SetActive(enabled);
      emit discoveryEnabledChanged();
  }
-@@ -1145,6 +1149,14 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+@@ -1145,6 +1150,14 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
          if (session != session_for_connections)
              return;
  
@@ -285,19 +329,45 @@ index 25af475..5f64d6f 100644
          if (chiaki_quit_reason_is_error(reason)) {
              QString m = tr("Chiaki Session has quit") + ":\n" + chiaki_quit_reason_string(reason);
              if (!reason_str.isEmpty())
-@@ -1237,7 +1249,10 @@ bool QmlBackend::closeRequested()
+@@ -1237,7 +1250,10 @@ bool QmlBackend::closeRequested()
  {
      if (!session)
          return true;
 -
 +    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")==QStringLiteral("1")) {
-+        session->Stop();
++        stopSession(true);
 +        return false;
 +    }
      bool stop = true;
      if (session->IsConnected()) {
          switch (settings->GetDisconnectAction()) {
-@@ -1836,7 +1851,7 @@ void QmlBackend::setIsAppActive()
+@@ -1638,6 +1654,25 @@ void QmlBackend::stopSession(bool sleep)
+     if (!session)
+         return;
+ 
++    if(qEnvironmentVariable("RELAY_RENDER_PROTOCOL")==QStringLiteral("1")) {
++        // GoToBed enqueues an authenticated control message. Allow the control
++        // worker to send it before stopping the session or releasing the job.
++        // Bind the timer to this exact session so it cannot stop a later one.
++        const bool standby = sleep && session->IsConnected();
++        if(standby && !session->property("relayStandbyRequested").toBool()) {
++            session->setProperty("relayStandbyRequested", true);
++            session->GoToBed();
++        }
++        if(!session->property("relayStopRequested").toBool()) {
++            session->setProperty("relayStopRequested", true);
++            QPointer<StreamSession> stopping(session);
++            QTimer::singleShot(standby ? 250 : 0, this, [this, stopping] {
++                if(stopping && session == stopping.data())stopping->Stop();
++            });
++        }
++        return;
++    }
++
+     if (!session_info.nickname.isEmpty())
+     {
+         waking_sleeping_nicknames.append(session_info.nickname);
+@@ -1836,7 +1871,7 @@ void QmlBackend::setIsAppActive()
  
  uint32_t QmlBackend::getStreamShortcut() const
  {
@@ -307,7 +377,7 @@ index 25af475..5f64d6f 100644
  	uint32_t stream_menu_shortcut1 = settings->GetStreamMenuShortcut1();
  	if(stream_menu_shortcut1 > 0)
 diff --git a/gui/src/qmlmainwindow.cpp b/gui/src/qmlmainwindow.cpp
-index f435a16..3f37bfc 100644
+index f435a16..7076410 100644
 --- a/gui/src/qmlmainwindow.cpp
 +++ b/gui/src/qmlmainwindow.cpp
 @@ -1,3 +1,10 @@
@@ -704,7 +774,7 @@ index f435a16..3f37bfc 100644
      if (event->modifiers() == Qt::NoModifier) {
          switch (event->key()) {
          case Qt::Key_F11:
-@@ -8675,3 +8823,183 @@ QObject *QmlMainWindow::focusObject() const
+@@ -8675,3 +8823,185 @@ QObject *QmlMainWindow::focusObject() const
  {
      return quick_window->focusObject();
  }
@@ -742,6 +812,7 @@ index f435a16..3f37bfc 100644
 +  st["lossPct"]=session->GetAveragePacketLoss()*100.0;
 +  st["netProbeRttMs"]=session->GetProbeRttMs();
 +  st["framesLost"]=session->GetFramesLost();
++  st["audio"]=session->GetRelayAudioStats();
 +  QStringList names;for(auto controller:session->GetControllers())if(controller->IsConnected())names<<controller->GetName();
 +  st["controllerSummary"]=names.isEmpty()?QStringLiteral("未连接实体手柄"):names.join(QStringLiteral("、"));
 + }
@@ -772,8 +843,9 @@ index f435a16..3f37bfc 100644
 +  return;
 + }
 + if(command.value("type").toString()=="stop"){
-+  // An explicit Relay stop never asks about sleep and never sends a standby request.
-+  if(session)backend->stopSession(false);else QCoreApplication::quit();
++  // User stop/app exit sleeps the console; settings reconnection opts out.
++  // No native confirmation dialog is involved in either path.
++  if(session)backend->stopSession(command.value("standby").toBool(true));else QCoreApplication::quit();
 +  return;
 + }
 + if(command.value("type").toString()=="devices"){
@@ -888,6 +960,83 @@ index f435a16..3f37bfc 100644
 +    std::printf("RELAY_RENDER %s\n",QJsonDocument(result).toJson(QJsonDocument::Compact).constData());std::fflush(stdout);
 +    return clean;
 +}
+diff --git a/gui/src/streamsession.cpp b/gui/src/streamsession.cpp
+index aefdedf..0355991 100755
+--- a/gui/src/streamsession.cpp
++++ b/gui/src/streamsession.cpp
+@@ -1358,6 +1358,16 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
+ 	spec.format = AUDIO_S16SYS;
+ 	audio_out_sample_size = sizeof(int16_t) * channels;
+ 	spec.samples = audio_buffer_size / audio_out_sample_size;
++	relay_audio_callback = qEnvironmentVariable("RELAY_RENDER_PROTOCOL") == "1";
++	if(relay_audio_callback)
++	{
++		// 512 sample frames = 10.7 ms at 48 kHz, rather than the old 4096.
++		spec.samples = 512;
++		spec.userdata = &relay_audio_buffer;
++		spec.callback = [](void *user, Uint8 *stream, int length) {
++			static_cast<RelayAudioBuffer *>(user)->read(stream, static_cast<size_t>(length));
++		};
++	}
+ 
+ 	SDL_AudioSpec obtained;
+ 	audio_out = SDL_OpenAudioDevice(audio_out_device_name.isEmpty() ? nullptr : qUtf8Printable(audio_out_device_name), false, &spec, &obtained, false);
+@@ -1382,7 +1392,9 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
+ 			"Audio output '%s' opened with converted format %#x, %u channels @ %u Hz (requested %#x, %u channels @ %u Hz)",
+ 			qPrintable(audio_out_device_name), obtained.format, obtained.channels, obtained.freq, spec.format, spec.channels, spec.freq);
+ 
+-	{
++	if(relay_audio_callback)
++		relay_audio_buffer.reset(rate, channels, obtained.samples);
++	else {
+ 		QMutexLocker locker(&audio_out_ring_mutex);
+ 		audio_out_ring_buf.resize((int)(audio_buffer_size * 8));
+ 		audio_out_ring_read_pos = 0;
+@@ -1392,7 +1404,8 @@ void StreamSession::InitAudio(unsigned int channels, unsigned int rate)
+ 	}
+ 
+ 	SDL_PauseAudioDevice(audio_out, 0);
+-	StartAudioOutDrainThread();
++	if(!relay_audio_callback)
++		StartAudioOutDrainThread();
+ 
+ 	CHIAKI_LOGI(log.GetChiakiLog(), "Audio Device '%s' opened with %u channels @ %d Hz, buffer size %u",
+ 				qPrintable(audio_out_device_name), obtained.channels, obtained.freq, obtained.size);
+@@ -1920,7 +1933,7 @@ void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
+ 
+ 	// qDebug() << "Audio queue" << (SDL_GetQueuedAudioSize(audio_out) / audio_out_sample_size / samples_count) * 10 << "ms";
+ 	// If the SDL queue runs away, drop the stale backlog and resume from the latest frame.
+-	if(SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
++	if(!relay_audio_callback && SDL_GetQueuedAudioSize(audio_out) > 3 * audio_buffer_size)
+ 	{
+ 		CHIAKI_LOGW(log.GetChiakiLog(), "Audio queue exceeded latency threshold, clearing queued audio");
+ 		SDL_ClearQueuedAudio(audio_out);
+@@ -1962,7 +1975,24 @@ void StreamSession::PushAudioFrame(int16_t *og_buf, size_t samples_count)
+ 	}
+ #endif
+ queue_audio:
+-	QueueAudioOutData(buf);
++	if(relay_audio_callback)
++		relay_audio_buffer.push(buf.constData(), static_cast<size_t>(buf.size()));
++	else
++		QueueAudioOutData(buf);
++}
++
++QJsonObject StreamSession::GetRelayAudioStats() const
++{
++	if(!relay_audio_callback) return {};
++	const auto s = relay_audio_buffer.snapshot();
++	if(!s.rate) return {};
++	return {{"mode", "device-callback"}, {"sampleRate", int(s.rate)}, {"channels", int(s.channels)},
++		{"devicePeriodMs", 1000.0 * s.period_frames / s.rate},
++		{"queuedMs", 1000.0 * s.queued_frames / s.rate},
++		{"peakQueuedMs", 1000.0 * s.peak_frames / s.rate},
++		{"capacityMs", 1000.0 * s.capacity_frames / s.rate},
++		{"droppedFrames", double(s.dropped_frames)}, {"underruns", double(s.underruns)},
++		{"playedFrames", double(s.played_frames)}, {"callbacks", double(s.callbacks)}};
+ }
+ 
+ void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 diff --git a/gui/tools/fgdx12test.cpp b/gui/tools/fgdx12test.cpp
 index a4423b0..98f0d04 100644
 --- a/gui/tools/fgdx12test.cpp

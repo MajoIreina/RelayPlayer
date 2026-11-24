@@ -17,7 +17,7 @@ $imageSize = 6543375
 $nameOffset = 0x221dbb
 $originalHash = 'c69a1e2dbf7406f74ae8a33c7c98fba226d79431a36aca5bc7143cedc4d19dec'
 if ($CommunityNr) { $runtimeName = 'chiaki-nr'; $imageSize = 5536256; $nameOffset = 0x45d124; $originalHash = '3488b8a2c6564f006b1447dc42b67e0fbafc5293963ee3af073a3f95e7db3e26' }
-if ($RelayRender) { $runtimeName = 'relay-render'; $imageSize = 5392384; $originalHash = '91b50f5f621dfeaf555fd5042f970b33741395ee6b9905f7d934815731334ebe' }
+if ($RelayRender) { $runtimeName = 'relay-render'; $imageSize = 5404672; $originalHash = '4d5a74e9f96c5d349d20e1aef576d4aeeeb8e73941e4b50e8f204647ce7e8d1b' }
 $bindingName = 'RelayPlayerProfileBindingV1'
 $ascii = [Text.Encoding]::ASCII
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
@@ -192,6 +192,10 @@ function Configure-Playback([string]$Namespace, [string]$Binding) {
                 if ($null -eq $raw -or ![long]::TryParse([string]$raw,[ref]$size) -or $size -le 0) { $size = 16384 }
                 $normalized = [long]65536
                 foreach ($allowed in @(2048,4096,8192,16384,32768,65536)) { if ($size -le $allowed) { $normalized = $allowed; break } }
+                # The Relay renderer pulls a single bounded PCM queue directly
+                # from the device callback. Migrate the previous 16 KiB safety
+                # default instead of preserving its 85 ms device period.
+                if ($RelayRender) { $normalized = 2048 }
                 $settings.SetValue('audio_buffer_size',[int]$normalized,[Microsoft.Win32.RegistryValueKind]::DWord)
                 $settings.SetValue('neural_render',$(if ($playback -and $playback.neuralRendering) { 'true' } elseif (!$playback -and $CommunityNr) { 'true' } else { 'false' }),[Microsoft.Win32.RegistryValueKind]::String)
                 if ($CommunityNr -or $RelayRender) {

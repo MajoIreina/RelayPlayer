@@ -11,6 +11,8 @@ mod chiaki;
 #[allow(dead_code)]
 #[path = "connections.rs"]
 mod connections;
+#[path = "wake.rs"]
+mod wake;
 
 use backend::{Backend, BackendEvent};
 use serde_json::{json, Value};
@@ -348,9 +350,12 @@ fn gui_fixture() -> Result<(), Box<dyn std::error::Error>> {
         thread::spawn(move || {
             for line in io::stdin().lock().lines() {
                 if let Ok(line) = line {
-                    if serde_json::from_str::<Value>(&line).is_ok_and(|v| v["type"] == "stop") {
-                        fs::write(&stop_marker, b"direct-stop-no-sleep").unwrap();
-                        break;
+                    if let Ok(command) = serde_json::from_str::<Value>(&line) {
+                        if command["type"] == "stop" {
+                            assert!(command["standby"].is_boolean());
+                            fs::write(&stop_marker, command.to_string()).unwrap();
+                            break;
+                        }
                     }
                 }
             }
@@ -570,11 +575,15 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         let _ = fs::remove_file(dir.join(name));
     }
-    for mode in ["protocol", "unresponsive"] {
+    for action in ["stop", "reconnect", "shutdown", "unresponsive"] {
         for name in ["fixture-started", "fixture-helper", "fixture-stop"] {
             let _ = fs::remove_file(dir.join(name));
         }
-        fs::write(dir.join("fixture-mode"), mode)?;
+        let protocol = action != "unresponsive";
+        fs::write(
+            dir.join("fixture-mode"),
+            if protocol { "protocol" } else { "unresponsive" },
+        )?;
         let mut player =
             chiaki::Player::new(root.clone(), Some(profile.clone()), Some(zip.clone()));
         player.begin_stream_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
@@ -584,21 +593,31 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
         let helper = process_handle(await_pid(&dir.join("fixture-helper")));
         player.use_render_protocol_fixture();
         let stop_at = Instant::now();
-        player.close()?;
-        assert!(
-            player.stopping()
-                && !player.video_received()
-                && player.render_feedback()["stats"].is_null()
-        );
-        assert!(matches!(
-            wait_for_gui(&mut player)?,
-            chiaki::Update::Closed(_)
-        ));
+        if action == "shutdown" {
+            player.shutdown();
+            assert!(!player.running());
+        } else {
+            if action == "reconnect" {
+                player.close_for_reconnect()?;
+            } else {
+                player.close()?;
+            }
+            assert!(
+                player.stopping()
+                    && !player.video_received()
+                    && player.render_feedback()["stats"].is_null()
+            );
+            assert!(matches!(
+                wait_for_gui(&mut player)?,
+                chiaki::Update::Closed(_)
+            ));
+        }
         assert!(stop_at.elapsed() < Duration::from_secs(3));
         assert_exited(&renderer);
         assert_exited(&helper);
-        if mode == "protocol" {
-            assert_eq!(fs::read(dir.join("fixture-stop"))?, b"direct-stop-no-sleep");
+        if protocol {
+            let command: Value = serde_json::from_slice(&fs::read(dir.join("fixture-stop"))?)?;
+            assert_eq!(command["standby"], action != "reconnect");
         }
         assert!(player.render_feedback()["stats"].is_null());
     }

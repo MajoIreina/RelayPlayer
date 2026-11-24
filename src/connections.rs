@@ -762,10 +762,7 @@ fn run(
                 .as_array()
                 .and_then(|hs| hs.iter().find(|h| h["hostId"] == args["hostId"]))
                 .ok_or_else(|| error("请选择已配对主机。"))?;
-            let key = decode16(h, "rp_regist_key")?;
-            let text = String::from_utf8_lossy(&key);
-            let credential = u64::from_str_radix(text.trim_matches('\0'), 16)
-                .map_err(|_| error("唤醒凭证无效。"))?;
+            let credential = crate::wake::credential(h)?;
             d::wakeup(
                 None,
                 h["ipAddress"].as_str().unwrap_or_default(),

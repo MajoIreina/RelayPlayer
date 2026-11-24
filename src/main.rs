@@ -13,6 +13,7 @@ mod platform;
 #[allow(dead_code)]
 #[path = "playback.rs"]
 mod playback;
+mod wake;
 use backend::{Backend, BackendEvent};
 use design::*;
 use egui::{
@@ -375,6 +376,8 @@ impl Relay {
             // streaming statistics or a positive NR hardware probe.
             self.state["status"]["phase"] = json!(if p.player.video_received() {
                 "streaming"
+            } else if p.waking() {
+                "waking"
             } else if p.player.stopping() {
                 "disconnecting"
             } else if p.player.running() {
@@ -382,7 +385,7 @@ impl Relay {
             } else {
                 "idle"
             });
-            self.state["operation"] = json!(if p.player.preparing() {
+            self.state["operation"] = json!(if p.player.preparing() || p.waking() {
                 "connect"
             } else {
                 &p.connections.operation

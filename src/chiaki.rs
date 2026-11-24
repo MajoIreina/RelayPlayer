@@ -349,6 +349,7 @@ struct Session {
     feedback: Arc<Mutex<serde_json::Value>>,
     stats_at: Arc<Mutex<Option<Instant>>>,
     closing_since: Option<Instant>,
+    closing_standby: bool,
     revision: u64,
     drainers: Vec<JoinHandle<()>>,
 }
@@ -375,14 +376,16 @@ unsafe extern "system" fn close_owned_tree(window: HWND, cookie: LPARAM) -> BOOL
     BOOL(1)
 }
 impl Session {
-    fn request_close(&mut self) {
-        if self.closing_since.is_some() {
+    fn request_close(&mut self, standby: bool) {
+        if self.closing_since.is_some() && (!standby || self.closing_standby) {
             return;
         }
         self.closing_since = Some(Instant::now());
+        self.closing_standby = standby;
         if self.provider == Provider::RelayRender {
             if let Some(input) = self.child.stdin.as_mut() {
-                let _ = writeln!(input, "{{\"type\":\"stop\"}}").and_then(|_| input.flush());
+                let _ = writeln!(input, "{{\"type\":\"stop\",\"standby\":{standby}}}")
+                    .and_then(|_| input.flush());
             }
         } else {
             unsafe {
@@ -392,7 +395,9 @@ impl Session {
     }
     fn shutdown(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
-            self.request_close();
+            if self.closing_since.is_none() {
+                self.request_close(true);
+            }
             // EOF also allows a headless or not-yet-created renderer to exit.
             self.child.stdin.take();
             unsafe {
@@ -670,18 +675,27 @@ impl Player {
         Ok(())
     }
     pub fn close(&mut self) -> io::Result<()> {
+        self.close_with_standby(true)
+    }
+    pub fn close_for_reconnect(&mut self) -> io::Result<()> {
+        self.close_with_standby(false)
+    }
+    fn close_with_standby(&mut self, standby: bool) -> io::Result<()> {
         if self.preparing() {
             self.cancel_preparation();
             return Ok(());
         }
         if let Some(session) = &mut self.session {
-            session.request_close();
+            session.request_close(standby);
         }
         Ok(())
     }
     pub fn shutdown(&mut self) {
         // End playback while its surface is still embedded; detaching first would
         // briefly restore a second, visible top-level playback window.
+        if let Some(session) = &mut self.session {
+            session.request_close(true);
+        }
         self.session.take();
         self.preparing.take();
         self.prepared = None;
@@ -1059,6 +1073,7 @@ impl Player {
             feedback,
             stats_at,
             closing_since: None,
+            closing_standby: false,
             revision: 1,
             drainers,
         })
