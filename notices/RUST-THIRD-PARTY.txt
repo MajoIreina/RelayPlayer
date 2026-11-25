@@ -2,7 +2,7 @@ Relay · Rust third-party notices / Rust 第三方软件声明
 
 Target: x86_64-pc-windows-msvc · 171 Cargo packages (normal + build dependency graph).
 Rust toolchain used: rustc 1.97.1 (8bab26f4f 2026-07-14)
-Cargo.lock SHA-256: 14c957dee68878869ecd01383175aa8e6ddad678c04794e4e2efdf5ca81cd3d0
+Cargo.lock SHA-256: ee584cfc9a0f2333c5d52f5687e5104bf2a23a3c4b37b14d4d321d32f6f0cd0b
 
 The index is generated from cargo tree --locked --target x86_64-pc-windows-msvc -e normal,build. It covers dependencies and build-time tools on that target, including proc macros; listing a package does not mean it is shipped separately. Registry checksums and license expressions below are the values from Cargo.lock and the corresponding published Cargo.toml. Authors are package metadata, not a complete list of rights holders. Texts come from the exact source packages, embedded font name tables and, where needed, the upstream repository at the package commit. Identical notices share a text identifier in the appendix.
 
