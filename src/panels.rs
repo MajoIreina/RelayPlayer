@@ -1321,6 +1321,8 @@ impl Panels {
                         3 => [1., 1., 1., 0.3, 0.6, 0.4, 0., 0.],
                         _ => [1., 1., 1., 0., 0., 0., 0., 0.],
                     };
+                    self.stage(s, "exposure", json!(0.0));
+                    self.stage(s, "brightness", json!(0.0));
                     for (k, v) in [
                         "saturation",
                         "contrast",
@@ -1341,6 +1343,8 @@ impl Panels {
         });
         egui::CollapsingHeader::new("微调颜色与质感").show(ui, |ui| {
             for (k, l, lo, hi) in [
+                ("exposure", "曝光度", -3., 3.),
+                ("brightness", "亮度", -1., 1.),
                 ("saturation", "饱和度", 0.5, 1.5),
                 ("contrast", "对比度", 0.8, 1.2),
                 ("gamma", "伽马", 0.8, 1.2),
@@ -1352,6 +1356,7 @@ impl Panels {
             ] {
                 self.slider(ui, s, k, l, lo, hi, 0.01);
             }
+            ui.small("曝光度每增加 1 EV，线性光亮度加倍；亮度调整整体明暗。0 为原始值。");
             self.check(ui, s, "antiAliasing", "抗锯齿");
             self.check(ui, s, "debanding", "去色带");
             self.setting_choice(
@@ -1738,6 +1743,18 @@ impl Panels {
         let stats = live_stats(st);
         let gpu = &s["gpu"];
         title(ui, "引擎与显示");
+        for (key, label) in [
+            ("hostReadyMs", "主机就绪"),
+            ("runtimeReadyMs", "组件就绪"),
+            ("launchMs", "启动串流组件"),
+            ("firstVideoSignalMs", "首个视频信号"),
+        ] {
+            if let Some(ms) = st["connectionTimings"][key].as_u64() {
+                row(ui, label, |ui| {
+                    ui.label(format!("{ms} ms"));
+                });
+            }
+        }
         row(ui, "显卡", |ui| {
             ui.label(gpu["adapterName"].as_str().unwrap_or(if playing(s) {
                 "渲染器尚未回报显卡信息"
@@ -1880,6 +1897,9 @@ impl Panels {
                 ("decodeMs", "解码延迟", " ms"),
                 ("renderMs", "渲染延迟", " ms"),
                 ("renderSubmitMs", "渲染提交耗时", " ms"),
+                ("settingsApplyMs", "设置应用耗时", " ms"),
+                ("filterRebuilds", "自定义滤镜累计创建", ""),
+                ("artcnnRebuilds", "ArtCNN 累计创建", ""),
                 ("netRttMs", "网络往返", " ms"),
                 ("netProbeRttMs", "连接探测往返", " ms"),
                 ("lossPct", "丢包率", " %"),

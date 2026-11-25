@@ -23,6 +23,32 @@ pub struct PublicPlayback {
     last_error: String,
     remembered_connection: bool,
     wake: Option<crate::wake::WakeTask>,
+    gate: Option<StartGate>,
+    pub snapshot: Value,
+    pub timings: Value,
+    connect_began: Option<std::time::Instant>,
+}
+
+// The two independent prerequisites may complete in either order.
+struct StartGate {
+    began: std::time::Instant,
+    host_ms: Option<u64>,
+    runtime_ms: Option<u64>,
+}
+impl StartGate {
+    fn new() -> Self {
+        Self {
+            began: std::time::Instant::now(),
+            host_ms: None,
+            runtime_ms: None,
+        }
+    }
+    fn elapsed_ms(&self) -> u64 {
+        self.began.elapsed().as_millis() as u64
+    }
+    fn ready(&self) -> bool {
+        self.host_ms.is_some() && self.runtime_ms.is_some()
+    }
 }
 impl PublicPlayback {
     pub fn new(
@@ -67,10 +93,16 @@ impl PublicPlayback {
             last_error: String::new(),
             remembered_connection: false,
             wake: None,
+            gate: None,
+            snapshot: json!({}),
+            timings: json!({}),
+            connect_began: None,
         }
     }
     pub fn stop(&mut self) -> io::Result<()> {
         self.wake = None;
+        self.gate = None;
+        self.connect_began = None;
         self.target = None;
         self.reconnect = false;
         self.capture = false;
@@ -83,7 +115,7 @@ impl PublicPlayback {
         Ok(())
     }
     pub fn feedback(&self) -> Value {
-        let f = self.player.render_feedback();
+        let f = &self.snapshot;
         let stats = &f["stats"];
         let pending = self.pending
             || (self.player.running()
@@ -101,8 +133,18 @@ impl PublicPlayback {
         {
             return Err(io::Error::other("请等待连接操作完成。"));
         }
+        self.connect_began = None;
+        self.timings = json!({});
+        self.snapshot = json!({});
+        let gate = StartGate::new();
         let target = self.connections.target(args)?;
         let wake = crate::wake::WakeTask::start(&target)?;
+        self.player
+            .set_playback_settings(crate::playback::session_settings(&self.settings).to_string())?;
+        self.player.set_render_settings(&self.settings)?;
+        self.player
+            .prepare_stream(self.settings["neuralRendering"] == true)?;
+        self.gate = Some(gate);
         self.remembered_connection = false;
         self.last_error.clear();
         self.capture = false;
@@ -113,7 +155,7 @@ impl PublicPlayback {
         Ok(())
     }
     pub fn waking(&self) -> bool {
-        self.wake.is_some()
+        self.gate.is_some() || self.wake.is_some()
     }
     pub fn capture(&mut self, args: &Value) -> io::Result<()> {
         if self.waking() {
@@ -163,12 +205,15 @@ impl PublicPlayback {
                 "当前后端尚未接入此参数；未将不支持的选项标记为生效。",
             ));
         }
-        if self.player.preparing() {
+        if self.player.preparing() || self.gate.is_some() {
             return Err(io::Error::other("请等待组件准备完成或取消后再调整设置。"));
         }
         let mut next = self.settings.clone();
         for (k, v) in object {
             next[k] = v.clone();
+        }
+        if next == self.settings {
+            return Ok(());
         }
         fs::create_dir_all(self.path.parent().unwrap())?;
         let tmp = self.path.with_extension("tmp");
@@ -178,10 +223,10 @@ impl PublicPlayback {
             && object
                 .iter()
                 .any(|(k, v)| crate::playback::session_key(k) && self.settings[k] != *v);
+        self.player.set_render_settings(&next)?;
+        self.settings = next;
         self.changed = object.keys().cloned().collect();
         self.sent_at = Some(std::time::Instant::now());
-        self.settings = next;
-        self.player.set_render_settings(&self.settings)?;
         self.pending = needs_reconnect;
         if needs_reconnect {
             self.reconnect = true;
@@ -204,7 +249,9 @@ impl PublicPlayback {
                 Event::Waiting => self.note = "主机已开机，等待远程游玩服务就绪……".into(),
                 Event::Failed(message) => {
                     self.wake = None;
+                    self.gate = None;
                     self.target = None;
+                    self.player.close()?;
                     self.progress = None;
                     self.note = message;
                 }
@@ -213,17 +260,24 @@ impl PublicPlayback {
                     if let Some(target) = &mut self.target {
                         target["ipAddress"] = json!(ip.to_string());
                     }
-                    self.player.set_playback_settings(
-                        crate::playback::session_settings(&self.settings).to_string(),
-                    )?;
-                    self.player.set_render_settings(&self.settings)?;
-                    self.player
-                        .prepare_stream(self.settings["neuralRendering"] == true)?;
+                    if let Some(gate) = &mut self.gate {
+                        gate.host_ms = Some(gate.elapsed_ms());
+                    }
                     self.note = "主机已就绪，正在检查串流组件……".into();
                 }
             }
         }
-        match self.player.poll()? {
+        let update = match self.player.poll() {
+            Ok(update) => update,
+            Err(error) => {
+                self.wake = None;
+                self.gate = None;
+                self.target = None;
+                self.progress = None;
+                return Err(error);
+            }
+        };
+        match update {
             Some(Update::Ready) => {
                 if self.devices || self.capture {
                     self.player.launch_capture(self.devices)?;
@@ -236,19 +290,9 @@ impl PublicPlayback {
                     self.progress = None;
                     return Ok(());
                 }
-                // Stop may have cancelled preparation just as Ready arrived.
-                // Never start a late session after its target was cleared.
-                let Some(target) = self.target.clone() else {
-                    return Ok(());
-                };
-                self.connections.write_runtime_host(&target)?;
-                self.player.launch_stream(
-                    &Connections::runtime_nickname(&target),
-                    target["ipAddress"].as_str().unwrap_or_default(),
-                )?;
-                self.pending = false;
-                self.progress = None;
-                self.note = "正在连接 PS5，等待视频画面……".into();
+                if let Some(gate) = &mut self.gate {
+                    gate.runtime_ms = Some(gate.elapsed_ms());
+                }
             }
             Some(Update::Progress(p)) => {
                 self.progress = Some(p.done as f32 / p.total as f32);
@@ -291,14 +335,43 @@ impl PublicPlayback {
                 };
             }
             Some(Update::Cancelled) => {
+                self.wake = None;
+                self.gate = None;
+                self.target = None;
                 self.progress = None;
                 self.note = "已取消组件准备。".into();
             }
             None => (),
         }
-        let f = self.player.render_feedback();
+        if self.gate.as_ref().is_some_and(StartGate::ready) {
+            let gate = self.gate.take().unwrap();
+            if let Some(target) = &self.target {
+                let launch = self.connections.write_runtime_host(target).and_then(|_| {
+                    self.player.launch_stream(
+                        &Connections::runtime_nickname(target),
+                        target["ipAddress"].as_str().unwrap_or_default(),
+                    )
+                });
+                if let Err(error) = launch {
+                    self.target = None;
+                    self.progress = None;
+                    self.player.close()?;
+                    return Err(error);
+                }
+                self.pending = false;
+                self.progress = None;
+                self.note = "正在连接 PS5，等待视频画面……".into();
+            }
+            self.timings = json!({"hostReadyMs":gate.host_ms,"runtimeReadyMs":gate.runtime_ms,"launchMs":gate.elapsed_ms()});
+            self.connect_began = Some(gate.began);
+        }
+        self.snapshot = self.player.render_feedback();
+        let f = &self.snapshot;
         if !self.capture && !self.remembered_connection && self.player.video_received() {
             self.remembered_connection = true;
+            if let Some(began) = self.connect_began.take() {
+                self.timings["firstVideoSignalMs"] = json!(began.elapsed().as_millis() as u64);
+            }
             self.note = "已连接 PS5，正在播放。".into();
             if let Some(target) = &self.target {
                 if let Err(e) = self.connections.remember_connected(target) {
@@ -342,6 +415,9 @@ mod tests {
         let mut p = PublicPlayback::new(root.clone(), root, true, None);
         p.target = Some(json!({"hostId":"020000000001","ipAddress":"127.0.0.1"}));
         p.wake = Some(crate::wake::WakeTask::ready_fixture());
+        let mut gate = StartGate::new();
+        gate.runtime_ms = Some(1);
+        p.gate = Some(gate);
         assert!(p.waking());
         p.stop().unwrap();
         p.poll().unwrap();
@@ -349,7 +425,57 @@ mod tests {
         assert!(p.target.is_none());
     }
     #[test]
+    fn old_picture_settings_load_with_neutral_new_controls_and_noop_save_writes_nothing() {
+        let root =
+            std::env::temp_dir().join(format!("Relay-Picture-017-QA-{}", std::process::id()));
+        let path = root.join("data/public-playback.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = br#"{"saturation":1.13,"gamma":1.05,"upscaler":"artcnn"}"#;
+        fs::write(&path, old).unwrap();
+        let mut p = PublicPlayback::new(root.clone(), root.clone(), true, None);
+        assert_eq!(p.settings["saturation"], 1.13);
+        assert_eq!(p.settings["upscaler"], "artcnn");
+        assert_eq!(p.settings["exposure"], 0.0);
+        assert_eq!(p.settings["brightness"], 0.0);
+        let time = fs::metadata(&path).unwrap().modified().unwrap();
+        p.save(&json!({"saturation":1.13})).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), old);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), time);
+        let mut gate = StartGate::new();
+        gate.runtime_ms = Some(1);
+        p.gate = Some(gate);
+        assert!(p.save(&json!({"fps":30})).is_err());
+        p.stop().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn connection_gate_never_launches_with_only_one_prerequisite() {
+        for host_first in [true, false] {
+            let mut gate = StartGate::new();
+            assert!(!gate.ready());
+            if host_first {
+                gate.host_ms = Some(1);
+            } else {
+                gate.runtime_ms = Some(1);
+            }
+            assert!(!gate.ready());
+            gate.host_ms = Some(2);
+            gate.runtime_ms = Some(3);
+            assert!(gate.ready());
+        }
+    }
+    #[test]
     fn playback_settings_are_bounded_and_never_accept_credentials_or_fake_algorithms() {
+        for (key, lo, hi) in [("exposure", -3.0, 3.0), ("brightness", -1.0, 1.0)] {
+            assert!(
+                valid_setting(key, &json!(0))
+                    && valid_setting(key, &json!(lo))
+                    && valid_setting(key, &json!(hi))
+            );
+            assert!(
+                !valid_setting(key, &json!(lo - 0.01)) && !valid_setting(key, &json!(hi + 0.01))
+            );
+        }
         assert!(valid_setting("bitrateKbps", &json!(200000)));
         assert!(!valid_setting("bitrateKbps", &json!(200001)));
         assert!(!valid_setting("bitrateKbps", &json!(-1)));

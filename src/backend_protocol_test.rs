@@ -230,6 +230,28 @@ fn run_contract() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::args().nth(1).as_deref() == Some("--check-import") {
+        let profile = PathBuf::from(env::args_os().nth(2).ok_or("missing profile")?);
+        let connections = connections::Connections::new(&profile, false);
+        assert!(
+            connections.startup_error.is_none(),
+            "imported vault did not validate"
+        );
+        let metadata = connections.metadata();
+        let settings: Value =
+            serde_json::from_slice(&fs::read(profile.join("data/public-playback.json"))?)?;
+        assert!(
+            settings
+                .as_object()
+                .is_some_and(|object| object.iter().all(|(k, v)| playback::valid(k, v))),
+            "imported settings did not validate"
+        );
+        println!(
+            "{}",
+            json!({"vaultValidated":true,"hostCount":metadata["consoles"].as_array().unwrap().len(),"accountLoaded":metadata["account"].is_object(),"settingsValidated":true})
+        );
+        return Ok(());
+    }
     if env::args().nth(1).as_deref() == Some("--fixture-wait") {
         thread::sleep(Duration::from_secs(45));
         return Ok(());
@@ -575,11 +597,11 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         let _ = fs::remove_file(dir.join(name));
     }
-    for action in ["stop", "reconnect", "shutdown", "unresponsive"] {
+    for action in ["stop", "reconnect", "shutdown", "unresponsive", "blocked"] {
         for name in ["fixture-started", "fixture-helper", "fixture-stop"] {
             let _ = fs::remove_file(dir.join(name));
         }
-        let protocol = action != "unresponsive";
+        let protocol = !matches!(action, "unresponsive" | "blocked");
         fs::write(
             dir.join("fixture-mode"),
             if protocol { "protocol" } else { "unresponsive" },
@@ -592,6 +614,12 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
         let renderer = process_handle(await_pid(&dir.join("fixture-started")));
         let helper = process_handle(await_pid(&dir.join("fixture-helper")));
         player.use_render_protocol_fixture();
+        if action == "blocked" {
+            let submitted = Instant::now();
+            player.send_control(&json!({"type":"devices","padding":"x".repeat(60000)}))?;
+            assert!(submitted.elapsed() < Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(50));
+        }
         let stop_at = Instant::now();
         if action == "shutdown" {
             player.shutdown();

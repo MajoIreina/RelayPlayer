@@ -39,6 +39,9 @@ use windows::Win32::{
     },
 };
 
+#[path = "control.rs"]
+mod control;
+
 const INSTALL_SCRIPT: &str = include_str!("../tools/ensure-chiaki.ps1");
 const RENDER_INSTALL_SCRIPT: &str = include_str!("../tools/ensure-relay-render.ps1");
 const PROFILE_SCRIPT: &str = include_str!("../tools/Initialize-ChiakiProfile.ps1");
@@ -343,6 +346,7 @@ fn ordinary(root: &Path, relative: &[&str]) -> io::Result<PathBuf> {
 struct Session {
     provider: Provider,
     child: Child,
+    control: control::Control,
     job: Option<OwnedHandle>,
     _image_lock: File,
     video_received: Arc<AtomicBool>,
@@ -383,10 +387,9 @@ impl Session {
         self.closing_since = Some(Instant::now());
         self.closing_standby = standby;
         if self.provider == Provider::RelayRender {
-            if let Some(input) = self.child.stdin.as_mut() {
-                let _ = writeln!(input, "{{\"type\":\"stop\",\"standby\":{standby}}}")
-                    .and_then(|_| input.flush());
-            }
+            let _ = self
+                .control
+                .send(&serde_json::json!({"type":"stop","standby":standby}));
         } else {
             unsafe {
                 let _ = EnumWindows(Some(close_owned_tree), LPARAM(self.child.id() as isize));
@@ -399,7 +402,7 @@ impl Session {
                 self.request_close(true);
             }
             // EOF also allows a headless or not-yet-created renderer to exit.
-            self.child.stdin.take();
+            self.control.finish();
             unsafe {
                 let remaining = Duration::from_millis(750)
                     .saturating_sub(self.closing_since.unwrap().elapsed());
@@ -416,6 +419,7 @@ impl Session {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
+        self.control.join();
         for reader in self.drainers.drain(..) {
             let _ = reader.join();
         }
@@ -644,25 +648,18 @@ impl Player {
             .session
             .as_mut()
             .ok_or_else(|| io::Error::other("播放组件尚未启动。"))?;
-        let input = session
-            .child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| io::Error::other("渲染控制通道已关闭。"))?;
-        writeln!(input, "{}", command)?;
-        input.flush()
+        session.control.send(command)
     }
     pub fn set_render_settings(&mut self, settings: &serde_json::Value) -> io::Result<()> {
+        if self.render_settings == *settings {
+            return Ok(());
+        }
         if let Some(session) = &mut self.session {
-            session.revision += 1;
-            let command = serde_json::json!({"type":"settings","revision":session.revision,"settings":settings});
-            let input = session
-                .child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| io::Error::other("渲染控制通道已关闭。"))?;
-            writeln!(input, "{}", command)?;
-            input.flush()?;
+            let revision = session.revision + 1;
+            session.control.send(
+                &serde_json::json!({"type":"settings","revision":revision,"settings":settings}),
+            )?;
+            session.revision = revision;
         }
         self.render_settings = settings.clone();
         Ok(())
@@ -681,6 +678,7 @@ impl Player {
         self.close_with_standby(false)
     }
     fn close_with_standby(&mut self, standby: bool) -> io::Result<()> {
+        self.prepared = None;
         if self.preparing() {
             self.cancel_preparation();
             return Ok(());
@@ -806,17 +804,25 @@ impl Player {
         let worker = thread::Builder::new()
             .name("relay-provider".into())
             .spawn(move || {
-                let result = run_script(
-                    &dest,
-                    archive.as_deref(),
-                    None,
-                    provider,
-                    model.as_deref(),
-                    None,
-                    installer,
-                    &tx,
-                    &signal,
-                )
+                let installed_render =
+                    provider == Provider::RelayRender && dest.join(provider.directory()).exists();
+                // The final manifest verifies the entire installed render tree. Do not
+                // additionally read/hash the donor runtime on every warm connection.
+                let result = (if installed_render {
+                    Ok(None)
+                } else {
+                    run_script(
+                        &dest,
+                        archive.as_deref(),
+                        None,
+                        provider,
+                        model.as_deref(),
+                        None,
+                        installer,
+                        &tx,
+                        &signal,
+                    )
+                })
                 .and_then(|_| {
                     if provider == Provider::RelayRender {
                         run_script(
@@ -915,6 +921,13 @@ impl Player {
             }
         }
         if let Some(session) = &mut self.session {
+            if session.closing_since.is_none() {
+                if let Some(error) = session.control.error() {
+                    session.shutdown();
+                    self.session.take();
+                    return Err(error);
+                }
+            }
             if session
                 .closing_since
                 .is_some_and(|at| at.elapsed() >= Duration::from_millis(750))
@@ -1034,14 +1047,25 @@ impl Player {
             let _ = child.wait();
             return Err(io::Error::other(format!("无法管理播放组件进程：{error}")));
         }
+        let mut control =
+            match control::Control::start(child.stdin.take().expect("piped native input")) {
+                Ok(control) => control,
+                Err(error) => {
+                    drop(job);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
         if provider == Provider::RelayRender {
-            if let Some(input) = child.stdin.as_mut() {
-                writeln!(
-                    input,
-                    "{}",
-                    serde_json::json!({"type":"settings","revision":1,"settings":self.render_settings})
-                )?;
-                input.flush()?;
+            let initial =
+                serde_json::json!({"type":"settings","revision":1,"settings":self.render_settings});
+            if let Err(error) = control.send(&initial) {
+                drop(job);
+                let _ = child.kill();
+                let _ = child.wait();
+                control.join();
+                return Err(error);
             }
         }
         let feedback = Arc::new(Mutex::new(serde_json::json!({})));
@@ -1067,6 +1091,7 @@ impl Player {
         Ok(Session {
             provider,
             child,
+            control,
             job: Some(job),
             _image_lock: image,
             video_received,

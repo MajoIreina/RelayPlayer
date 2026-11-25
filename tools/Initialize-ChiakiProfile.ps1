@@ -17,7 +17,7 @@ $imageSize = 6543375
 $nameOffset = 0x221dbb
 $originalHash = 'c69a1e2dbf7406f74ae8a33c7c98fba226d79431a36aca5bc7143cedc4d19dec'
 if ($CommunityNr) { $runtimeName = 'chiaki-nr'; $imageSize = 5536256; $nameOffset = 0x45d124; $originalHash = '3488b8a2c6564f006b1447dc42b67e0fbafc5293963ee3af073a3f95e7db3e26' }
-if ($RelayRender) { $runtimeName = 'relay-render'; $imageSize = 5404672; $originalHash = '4d5a74e9f96c5d349d20e1aef576d4aeeeb8e73941e4b50e8f204647ce7e8d1b' }
+if ($RelayRender) { $runtimeName = 'relay-render'; $imageSize = 5422080; $originalHash = '615a26dd956fb37466792d396bdd6ad2906017b71b9b993a1fda4908a57855f6' }
 $bindingName = 'RelayPlayerProfileBindingV1'
 $ascii = [Text.Encoding]::ASCII
 $utf8 = [Text.UTF8Encoding]::new($false, $true)

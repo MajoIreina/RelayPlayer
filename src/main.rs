@@ -380,7 +380,7 @@ impl Relay {
                 "waking"
             } else if p.player.stopping() {
                 "disconnecting"
-            } else if p.player.running() {
+            } else if p.player.running() || p.player.preparing() {
                 "connecting"
             } else {
                 "idle"
@@ -391,7 +391,8 @@ impl Relay {
                 &p.connections.operation
             });
             self.state["connectionError"] = json!(p.connections.startup_error);
-            let render_feedback = p.player.render_feedback();
+            let render_feedback = &p.snapshot;
+            self.state["status"]["connectionTimings"] = p.timings.clone();
             self.state["status"]["stats"] = render_feedback["stats"].clone();
             self.state["gpu"] = render_feedback["stats"]["gpu"].clone();
             self.state["status"]["telemetryStale"] = render_feedback["telemetryStale"].clone();

@@ -1,6 +1,6 @@
 [package]
 name = "relay-ps5"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 description = "使用 chiaki-ng 连接 PS5 的 Windows 播放器。"
 license = "AGPL-3.0-only"

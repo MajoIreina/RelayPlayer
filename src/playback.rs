@@ -4,7 +4,7 @@ pub fn defaults() -> Value {
     serde_json::from_str(r#"{
  "resolution":"1080p","fps":60,"bitrateKbps":30000,"codec":"hevc","pictureSource":"stream",
  "lockBitrate":false,"framePacing":"auto","hdr":false,"autoHdr":false,"toneMapMode":"auto","ambientFill":false,
- "saturation":1.0,"contrast":1.0,"gamma":1.0,"vibrance":0.0,"shadowBoost":0.0,"clarity":0.0,"colorTemperature":0.0,"filmGrain":0.0,
+ "exposure":0.0,"brightness":0.0,"saturation":1.0,"contrast":1.0,"gamma":1.0,"vibrance":0.0,"shadowBoost":0.0,"clarity":0.0,"colorTemperature":0.0,"filmGrain":0.0,
  "antiAliasing":false,"debanding":false,"debandingStrength":"medium",
  "upscaler":"off","upscalerTarget":"auto","upscalerQuality":"0","artcnnStyle":"auto","upscalerSharpness":0.0,"textureRecovery":0.0,
  "neuralRendering":false,"neuralRenderingPreset":"default","neuralRenderingIntensity":1.0,"neuralRenderingHudProtection":"smart","neuralRenderingColorPreserve":true,
@@ -51,7 +51,8 @@ pub fn valid(key: &str, v: &Value) -> bool {
         | "frameGeneration" => v.is_boolean(),
         "saturation" => range(0.5, 1.5),
         "contrast" | "gamma" => range(0.8, 1.2),
-        "vibrance" | "colorTemperature" => range(-1.0, 1.0),
+        "exposure" => range(-3.0, 3.0),
+        "brightness" | "vibrance" | "colorTemperature" => range(-1.0, 1.0),
         "shadowBoost" | "clarity" | "filmGrain" | "upscalerSharpness" | "textureRecovery" => {
             range(0.0, 1.0)
         }
