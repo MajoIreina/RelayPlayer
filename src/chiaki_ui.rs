@@ -127,7 +127,7 @@ impl PublicPlayback {
         let retry = self.player.running() && !self.pending && !self.reconnect && !self.waking();
         json!({"pendingSettings":if pending{self.changed.clone()}else{Vec::new()},
             "upscaler":{"requested":up,"actual":stats["activeUpscaler"],"state":state,"reason":stats["upscalerReason"],"canRetry":retry && up!="off" && state!="suspended"},
-            "frameGeneration":{"canRetry":retry && self.settings["frameGeneration"]==true},
+            "frameGeneration":{"canRetry":retry && self.settings["frameGeneration"]==true && stats["frameGenerationReasonCode"]!=4},
             "bitrateLock":{"state":if self.settings["lockBitrate"]==true{if self.pending{"pending-reconnect"}else{"locked"}}else{"off"},"targetKbps":self.settings["bitrateKbps"]}})
     }
     // Restart the isolated renderer rather than re-entering a driver/runtime that failed.
@@ -412,8 +412,11 @@ impl PublicPlayback {
         }
         self.snapshot = self.player.render_feedback();
         let f = &self.snapshot;
-        self.enhancement_recovery_required |=
-            f["stats"]["upscalerState"] == "error" || f["stats"]["frameGenerationReasonCode"] == 2;
+        self.enhancement_recovery_required |= f["stats"]["upscalerState"] == "error"
+            || matches!(
+                f["stats"]["frameGenerationReasonCode"].as_i64(),
+                Some(2 | 5 | 6)
+            );
         if !self.capture && !self.remembered_connection && self.player.video_received() {
             self.remembered_connection = true;
             if let Some(began) = self.connect_began.take() {

@@ -93,7 +93,7 @@ fn title(ui: &mut Ui, text: &str) {
     ui.add_space(3.0);
 }
 fn note(ui: &mut Ui, text: impl Into<String>) {
-    ui.label(RichText::new(text.into()).small().weak());
+    ui.add(egui::Label::new(RichText::new(text.into()).small().weak()).wrap());
 }
 fn divider(ui: &mut Ui) {
     ui.add_space(7.0);
@@ -130,16 +130,24 @@ fn edit(
     .labelled_by(caption.id);
 }
 fn row(ui: &mut Ui, label: &str, right: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         let width = (ui.available_width() * 0.38).clamp(56., 132.);
         ui.allocate_ui_with_layout(
             egui::vec2(width, 22.),
-            egui::Layout::left_to_right(egui::Align::Center),
+            egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.label(label);
             },
         );
-        right(ui);
+        let value_width = ui.available_width().max(1.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(value_width, 22.),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                right(ui);
+            },
+        );
     });
 }
 fn choose(
@@ -1308,64 +1316,62 @@ impl Panels {
         self.apply(ui, Tab::Capture, s, out);
     }
     fn picture(&mut self, ui: &mut Ui, s: &Value, out: &mut Actions) {
-        if s["publicRuntime"] == true {
-            note(ui,"画质、超分与补帧通过渲染通道应用；串流参数修改后自动重连。实际效果以运行状态回报为准。");
-        }
-        title(ui, "画面风格");
-        ui.horizontal_wrapped(|ui| {
-            for (key, label) in [(0, "原样"), (1, "鲜艳"), (2, "电影"), (3, "竞技")] {
-                if ui.add(egui::Button::new(label)).clicked() {
-                    let values = match key {
-                        1 => [1.0, 1.06, 1., 0.5, 0., 0.3, 0., 0.],
-                        2 => [0.95, 1.08, 1., 0.2, 0., 0., 0.3, 0.3],
-                        3 => [1., 1., 1., 0.3, 0.6, 0.4, 0., 0.],
-                        _ => [1., 1., 1., 0., 0., 0., 0., 0.],
-                    };
-                    self.stage(s, "exposure", json!(0.0));
-                    self.stage(s, "brightness", json!(0.0));
-                    for (k, v) in [
-                        "saturation",
-                        "contrast",
-                        "gamma",
-                        "vibrance",
-                        "shadowBoost",
-                        "clarity",
-                        "colorTemperature",
-                        "filmGrain",
-                    ]
-                    .into_iter()
-                    .zip(values)
-                    {
-                        self.stage(s, k, json!(v));
-                    }
-                }
-            }
-        });
-        egui::CollapsingHeader::new("微调颜色与质感").show(ui, |ui| {
-            for (k, l, lo, hi) in [
-                ("exposure", "曝光度", -3., 3.),
-                ("brightness", "亮度", -1., 1.),
-                ("saturation", "饱和度", 0.5, 1.5),
-                ("contrast", "对比度", 0.8, 1.2),
-                ("gamma", "伽马", 0.8, 1.2),
-                ("vibrance", "鲜艳度", -1., 1.),
-                ("shadowBoost", "暗部提升", 0., 1.),
-                ("clarity", "清晰度", 0., 1.),
-                ("colorTemperature", "色温", -1., 1.),
-                ("filmGrain", "颗粒", 0., 1.),
-            ] {
-                self.slider(ui, s, k, l, lo, hi, 0.01);
-            }
-            ui.small("曝光度每增加 1 EV，线性光亮度加倍；亮度调整整体明暗。0 为原始值。");
-            self.check(ui, s, "antiAliasing", "抗锯齿");
-            self.check(ui, s, "debanding", "去色带");
+        note(ui, "修改后点击应用；串流参数会触发重连。");
+        egui::CollapsingHeader::new("串流输入").show(ui, |ui| {
             self.setting_choice(
                 ui,
                 s,
-                "debandingStrength",
-                "去色带强度",
-                &[("low", "低"), ("medium", "中"), ("high", "高")],
+                "pictureSource",
+                "画面来源",
+                &[
+                    ("stream", "网络串流"),
+                    ("capture", "采集画面 + 网络控制"),
+                    ("auto", "自动"),
+                ],
             );
+            self.setting_choice(
+                ui,
+                s,
+                "resolution",
+                "源分辨率",
+                &[("1080p", "1080p"), ("720p", "720p"), ("540p", "540p")],
+            );
+            self.setting_choice(
+                ui,
+                s,
+                "fps",
+                "源帧率",
+                &[("60", "60 fps"), ("30", "30 fps")],
+            );
+            self.bitrate(ui, s);
+            self.check(ui, s, "lockBitrate", "锁定目标码率");
+            if let Some(message) =
+                bitrate_lock_message(&s["status"]["renderFeedback"]["bitrateLock"])
+            {
+                note(ui, message);
+            } else {
+                note(ui, "锁定请求值；实际码率由 PS5 决定。");
+            }
+            note(ui, "最高 200 Mbps 为实验值；修改后重连。");
+            self.setting_choice(
+                ui,
+                s,
+                "codec",
+                "视频编码",
+                &[("hevc", "HEVC / H.265"), ("h264", "H.264")],
+            );
+            if s["publicRuntime"] == true {
+                note(ui, "纠错与码率恢复由协议管理。");
+            } else {
+                self.number(ui, s, "fecRatioPercent", "纠错冗余", 0, 50, 1., " %");
+                let locked = self.get(s, "lockBitrate").as_bool().unwrap_or(false);
+                ui.add_enabled_ui(!locked, |ui| {
+                    self.check(ui, s, "adaptiveBitrateRestoration", "自动恢复码率");
+                });
+                if locked {
+                    note(ui, "锁定期间自动恢复码率已关闭；解锁后恢复此项设置。");
+                }
+            }
         });
         divider(ui);
         title(ui, "超分辨率");
@@ -1377,7 +1383,7 @@ impl Panels {
             &[
                 ("off", "关闭"),
                 ("fsr1", "AMD FSR 1"),
-                ("rtx-vsr", "NVIDIA RTX 视频超分"),
+                ("rtx-vsr", "RTX 视频超分"),
                 ("artcnn", "ArtCNN"),
                 ("integer", "整数缩放"),
             ],
@@ -1389,20 +1395,14 @@ impl Panels {
         ) {
             note(ui, actual);
         } else if self.upscaler_request.is_some() {
-            note(
-                ui,
-                "设置已发送，等待引擎确认并处理新视频帧。所选设置不代表已生效。",
-            );
+            note(ui, "应用中，等待新画面。");
         } else {
-            note(
-                ui,
-                "播放后会按引擎回报显示实际启用的超分算法。所选设置不代表已生效。",
-            );
+            note(ui, "播放后显示实际效果。");
         }
         if s["status"]["renderFeedback"]["upscaler"]["canRetry"].as_bool() == Some(true)
             && btn(
                 ui,
-                "重试所选超分算法（重新连接）",
+                "重试超分（重连）",
                 can_play(s) && !self.draft.contains_key("upscaler"),
             )
         {
@@ -1445,135 +1445,163 @@ impl Panels {
             );
         }
         self.slider(ui, s, "upscalerSharpness", "锐度", 0., 1., 0.05);
-        self.slider(ui, s, "textureRecovery", "纹理恢复", 0., 1., 0.05);
         divider(ui);
-        title(ui, "DLSS 5 神经渲染");
-        // The requested flag belongs to the backend, shared with the transport bar.
-        // Do not stage this flag behind unrelated uncommitted picture changes.
-        let requested = s["settings"]["neuralRendering"].as_bool().unwrap_or(false);
-        let mut nr = requested;
-        let gpu = &s["gpu"];
-        let capable = gpu["dlssNrSupported"].as_bool() == Some(true);
-        if ui
-            .add_enabled(
-                can_play(s) && (s["publicRuntime"] == true || capable || nr),
-                egui::Checkbox::new(&mut nr, "启用 DLSS 5 NR"),
-            )
-            .changed()
-        {
-            cmd(out, "settings", json!({"neuralRendering":nr}));
-        }
-        let blocker = strval(gpu, "nrUnavailableReason").trim();
-        if !blocker.is_empty() {
-            note(ui, nr_reason(blocker));
-        } else if s["publicRuntime"] == true {
-            note(
-                ui,
-                "需要兼容的 RTX 显卡与驱动；准备组件不代表 NR 已实际处理视频帧。",
-            );
-        } else if !capable {
-            note(
-                ui,
-                if gpu["dlssNrSupported"].as_bool() == Some(false) {
-                    "当前显卡或驱动未报告 NR 支持。"
-                } else {
-                    "等待引擎确认 NR 硬件能力。"
-                },
-            );
-        }
-        let st = &s["status"];
-        let stats = live_stats(st);
-        let reported = if self.nr_request.is_some() {
-            Some("应用中，等待新视频帧确认".to_owned())
-        } else {
-            playing(s)
-                .then(|| nr_frame_state(st, stats, gpu, requested))
-                .flatten()
-        };
-        if let Some(actual) = reported {
-            let reason = strval(stats, "neuralRenderingReason").trim();
-            let detail = if reason.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", nr_reason(reason))
-            };
-            note(ui, format!("实际 NR：{actual}{detail}"));
-        } else if requested && gpu["dlssNrSupported"].as_bool() == Some(false) {
-            note(ui, "保存的 NR 偏好仍在，当前不能启用；可关闭此开关。");
-        } else if requested {
-            note(ui, "已选 NR；等待引擎回报实际帧状态。");
-        } else if capable {
-            note(
-                ui,
-                "此开关与底栏同步，立即应用。播放后可在状态页查看实际效果。",
-            );
-        }
-        self.setting_choice(
-            ui,
-            s,
-            "neuralRenderingPreset",
-            "风格",
-            &[
-                ("default", "默认"),
-                ("natural", "自然"),
-                ("cinematic", "电影"),
-            ],
-        );
-        self.slider(ui, s, "neuralRenderingIntensity", "强度", 0., 3., 0.1);
-        self.setting_choice(
-            ui,
-            s,
-            "neuralRenderingHudProtection",
-            "HUD 保护",
-            &[("off", "关闭"), ("smart", "智能"), ("strict", "严格")],
-        );
-        self.check(ui, s, "neuralRenderingColorPreserve", "保留原始色彩");
-        if s["publicRuntime"] == true {
-            note(
-                ui,
-                "当前 NR 模型未提供 HUD 保护与原色保留接口，这两项暂不可用。",
-            );
-        }
+        egui::CollapsingHeader::new("补帧")
+            .default_open(self.get(s, "frameGeneration") == true)
+            .show(ui, |ui| {
+                self.check(ui, s, "frameGeneration", "启用补帧");
+                if s["publicRuntime"] == true && playing(s) {
+                    let stats = live_stats(&s["status"]);
+                    if let Some(n) = stats["frameGenerationMultiplier"]
+                        .as_u64()
+                        .filter(|n| *n > 1)
+                    {
+                        note(
+                            ui,
+                            format!(
+                                "实际补帧：{n}× · {} · 源 {:.1} fps → 输出 {:.1} fps",
+                                strval(stats, "frameGenerationBackend"),
+                                stats["frameGenerationSourceFps"].as_f64().unwrap_or(0.),
+                                stats["outputFps"].as_f64().unwrap_or(0.)
+                            ),
+                        );
+                    } else if !strval(stats, "frameGenerationReason").is_empty() {
+                        note(ui, strval(stats, "frameGenerationReason"));
+                    } else if self.get(s, "frameGeneration") == true {
+                        note(ui, "等待新画面；60 fps 补帧需至少 120 Hz。");
+                    }
+                    if s["status"]["renderFeedback"]["frameGeneration"]["canRetry"] == true
+                        && btn(
+                            ui,
+                            "重试补帧（重连）",
+                            can_play(s)
+                                && !self.draft.contains_key("frameGeneration")
+                                && !self.draft.contains_key("frameGenerationBackend"),
+                        )
+                    {
+                        cmd(out, "retry-frame-generation", json!({}));
+                    }
+                }
+                self.setting_choice(
+                    ui,
+                    s,
+                    "frameGenerationBackend",
+                    "引擎",
+                    &[
+                        ("dlssg", "DLSS 帧生成"),
+                        ("nvidia", "NVIDIA 视频补帧"),
+                        ("warp", "光流补帧"),
+                    ],
+                );
+                self.setting_choice(
+                    ui,
+                    s,
+                    "frameGenerationMultiplier",
+                    "倍率",
+                    &[("2", "2×"), ("3", "3×"), ("4", "4×")],
+                );
+                self.setting_choice(
+                    ui,
+                    s,
+                    "frameDedup",
+                    "源帧去重",
+                    &[
+                        ("off", "关闭"),
+                        ("auto", "自动识别"),
+                        ("60-to-30", "60 → 30 后补帧"),
+                    ],
+                );
+                if s["publicRuntime"] == true {
+                    note(ui, "倍率基于去重后的源帧；输出受刷新率限制。");
+                }
+            });
         divider(ui);
-        egui::CollapsingHeader::new("串流画质与画面来源").show(ui, |ui| {
-            self.setting_choice(
-                ui,
-                s,
-                "pictureSource",
-                "画面来源",
-                &[
-                    ("stream", "网络串流"),
-                    ("capture", "采集画面 + 网络控制"),
-                    ("auto", "自动"),
-                ],
-            );
-            self.setting_choice(
-                ui,
-                s,
-                "resolution",
-                "分辨率",
-                &[("1080p", "1080p"), ("720p", "720p"), ("540p", "540p")],
-            );
-            self.setting_choice(ui, s, "fps", "帧率", &[("60", "60 fps"), ("30", "30 fps")]);
-            self.bitrate(ui, s);
-            self.check(ui, s, "lockBitrate", "锁定本地目标码率");
-            if let Some(message) =
-                bitrate_lock_message(&s["status"]["renderFeedback"]["bitrateLock"])
-            {
-                note(ui, message);
-            } else {
-                note(ui, "只锁定 Relay 的本地目标请求，不保证 PS5 实际输出码率。");
+        egui::CollapsingHeader::new("HDR 与色调映射")
+            .default_open(self.get(s, "hdr") == true)
+            .show(ui, |ui| {
+                self.check(ui, s, "hdr", "请求 HDR");
+                ui.add_enabled_ui(s["publicRuntime"] != true, |ui| {
+                    self.check(ui, s, "autoHdr", "自动 HDR");
+                });
+                if s["publicRuntime"] == true {
+                    note(ui, "HDR 需 HEVC；自动检测暂不可用。");
+                }
+                self.setting_choice(
+                    ui,
+                    s,
+                    "toneMapMode",
+                    "色调映射",
+                    &[
+                        ("auto", "自动"),
+                        ("hdr10-passthrough", "HDR10 直通"),
+                        ("bt2390-sdr", "BT.2390 转 SDR"),
+                    ],
+                );
+                note(ui, "RTX 超分／补帧：HDR 输入需选转 SDR。");
+                let stats = live_stats(&s["status"]);
+                if stats["hdrPreconversion"] == "active" {
+                    note(ui, "当前：HDR → SDR → 超分／补帧");
+                }
+            });
+        divider(ui);
+        title(ui, "色彩与质感");
+        ui.horizontal_wrapped(|ui| {
+            for (key, label) in [(0, "原样"), (1, "鲜艳"), (2, "电影"), (3, "竞技")] {
+                if ui.add(egui::Button::new(label)).clicked() {
+                    let values = match key {
+                        1 => [1.0, 1.06, 1., 0.5, 0., 0.3, 0., 0.],
+                        2 => [0.95, 1.08, 1., 0.2, 0., 0., 0.3, 0.3],
+                        3 => [1., 1., 1., 0.3, 0.6, 0.4, 0., 0.],
+                        _ => [1., 1., 1., 0., 0., 0., 0., 0.],
+                    };
+                    self.stage(s, "exposure", json!(0.0));
+                    self.stage(s, "brightness", json!(0.0));
+                    for (k, v) in [
+                        "saturation",
+                        "contrast",
+                        "gamma",
+                        "vibrance",
+                        "shadowBoost",
+                        "clarity",
+                        "colorTemperature",
+                        "filmGrain",
+                    ]
+                    .into_iter()
+                    .zip(values)
+                    {
+                        self.stage(s, k, json!(v));
+                    }
+                }
             }
-            note(
-                ui,
-                "200 Mbps 为实验性目标；修改后需重新连接。实际吞吐以引擎回报为准。",
-            );
+        });
+        egui::CollapsingHeader::new("微调颜色与质感").show(ui, |ui| {
+            for (k, l, lo, hi) in [
+                ("exposure", "曝光度", -3., 3.),
+                ("brightness", "亮度", -1., 1.),
+                ("saturation", "饱和度", 0.5, 1.5),
+                ("contrast", "对比度", 0.8, 1.2),
+                ("gamma", "伽马", 0.8, 1.2),
+                ("vibrance", "鲜艳度", -1., 1.),
+                ("shadowBoost", "暗部提升", 0., 1.),
+                ("clarity", "清晰度", 0., 1.),
+                ("textureRecovery", "纹理恢复", 0., 1.),
+                ("colorTemperature", "色温", -1., 1.),
+                ("filmGrain", "颗粒", 0., 1.),
+            ] {
+                self.slider(ui, s, k, l, lo, hi, 0.01);
+            }
+            note(ui, "曝光：每 +1 EV 亮一倍；亮度：整体明暗。");
+        });
+        divider(ui);
+        egui::CollapsingHeader::new("画面清理与显示").show(ui, |ui| {
+            self.check(ui, s, "antiAliasing", "抗锯齿");
+            self.check(ui, s, "debanding", "去色带");
             self.setting_choice(
                 ui,
                 s,
-                "codec",
-                "视频编码",
-                &[("hevc", "HEVC / H.265"), ("h264", "H.264")],
+                "debandingStrength",
+                "去色带强度",
+                &[("low", "低"), ("medium", "中"), ("high", "高")],
             );
             self.setting_choice(
                 ui,
@@ -1586,102 +1614,92 @@ impl Panels {
                     ("auto", "自动"),
                 ],
             );
-            self.number(ui, s, "fecRatioPercent", "纠错冗余", 0, 50, 1., " %");
-            if s["publicRuntime"] == true {
-                note(
-                    ui,
-                    "纠错冗余由串流协议管理；当前后端未开放手动冗余与自动恢复码率接口。",
-                );
-            }
-            let locked = self.get(s, "lockBitrate").as_bool().unwrap_or(false);
-            ui.add_enabled_ui(!locked, |ui| {
-                self.check(ui, s, "adaptiveBitrateRestoration", "自动恢复码率");
-            });
-            if locked {
-                note(ui, "锁定期间自动恢复码率已关闭；解锁后恢复此项设置。");
-            }
-            self.check(ui, s, "hdr", "请求 HDR");
-            self.check(ui, s, "autoHdr", "自动 HDR");
-            if s["publicRuntime"] == true {
-                note(ui, "HDR 请使用“请求 HDR”；系统自动 HDR 检测暂不可用。");
-            }
-            self.setting_choice(
-                ui,
-                s,
-                "toneMapMode",
-                "色调映射",
-                &[
-                    ("auto", "自动"),
-                    ("hdr10-passthrough", "HDR10 直通"),
-                    ("bt2390-sdr", "BT.2390 转 SDR"),
-                ],
-            );
             self.check(ui, s, "ambientFill", "填充画面边缘");
         });
-        egui::CollapsingHeader::new("补帧").show(ui, |ui| {
-            self.check(ui, s, "frameGeneration", "启用帧生成");
-            if s["publicRuntime"] == true && playing(s) {
-                let stats = live_stats(&s["status"]);
-                if let Some(n) = stats["frameGenerationMultiplier"]
-                    .as_u64()
-                    .filter(|n| *n > 1)
+        divider(ui);
+        egui::CollapsingHeader::new("神经渲染（NR）")
+            .default_open(s["settings"]["neuralRendering"] == true)
+            .show(ui, |ui| {
+                // The requested flag belongs to the backend, shared with the transport bar.
+                // Do not stage this flag behind unrelated uncommitted picture changes.
+                let requested = s["settings"]["neuralRendering"].as_bool().unwrap_or(false);
+                let mut nr = requested;
+                let gpu = &s["gpu"];
+                let capable = gpu["dlssNrSupported"].as_bool() == Some(true);
+                if ui
+                    .add_enabled(
+                        can_play(s) && (s["publicRuntime"] == true || capable || nr),
+                        egui::Checkbox::new(&mut nr, "启用 DLSS 5 NR"),
+                    )
+                    .changed()
                 {
+                    cmd(out, "settings", json!({"neuralRendering":nr}));
+                }
+                let blocker = strval(gpu, "nrUnavailableReason").trim();
+                if !blocker.is_empty() {
+                    note(ui, nr_reason(blocker));
+                } else if s["publicRuntime"] == true {
+                    note(ui, "需兼容的 RTX 显卡与驱动。");
+                } else if !capable {
                     note(
                         ui,
-                        format!(
-                            "实际补帧：{n}× · {} · 源 {:.1} fps → 输出 {:.1} fps",
-                            strval(stats, "frameGenerationBackend"),
-                            stats["frameGenerationSourceFps"].as_f64().unwrap_or(0.),
-                            stats["outputFps"].as_f64().unwrap_or(0.)
-                        ),
+                        if gpu["dlssNrSupported"].as_bool() == Some(false) {
+                            "当前显卡或驱动未报告 NR 支持。"
+                        } else {
+                            "等待引擎确认 NR 硬件能力。"
+                        },
                     );
-                } else if !strval(stats, "frameGenerationReason").is_empty() {
-                    note(ui, strval(stats, "frameGenerationReason"));
-                } else if self.get(s, "frameGeneration") == true {
-                    note(
+                }
+                let st = &s["status"];
+                let stats = live_stats(st);
+                let reported = if self.nr_request.is_some() {
+                    Some("应用中，等待新视频帧确认".to_owned())
+                } else {
+                    playing(s)
+                        .then(|| nr_frame_state(st, stats, gpu, requested))
+                        .flatten()
+                };
+                if let Some(actual) = reported {
+                    let reason = strval(stats, "neuralRenderingReason").trim();
+                    let detail = if reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", nr_reason(reason))
+                    };
+                    note(ui, format!("实际 NR：{actual}{detail}"));
+                } else if requested && gpu["dlssNrSupported"].as_bool() == Some(false) {
+                    note(ui, "当前无法启用 NR。");
+                } else if requested {
+                    note(ui, "已选 NR，等待新画面。");
+                } else if capable {
+                    note(ui, "与底栏同步，立即应用。");
+                }
+                self.setting_choice(
+                    ui,
+                    s,
+                    "neuralRenderingPreset",
+                    "风格",
+                    &[
+                        ("default", "默认"),
+                        ("natural", "自然"),
+                        ("cinematic", "电影"),
+                    ],
+                );
+                self.slider(ui, s, "neuralRenderingIntensity", "强度", 0., 3., 0.1);
+                ui.add_enabled_ui(s["publicRuntime"] != true, |ui| {
+                    self.setting_choice(
                         ui,
-                        "等待补帧引擎处理新画面；60 fps 源输入通常需要至少 120 Hz 显示器。",
+                        s,
+                        "neuralRenderingHudProtection",
+                        "HUD 保护",
+                        &[("off", "关闭"), ("smart", "智能"), ("strict", "严格")],
                     );
+                    self.check(ui, s, "neuralRenderingColorPreserve", "保留原始色彩");
+                });
+                if s["publicRuntime"] == true {
+                    note(ui, "HUD 保护与原色保留暂不可用。");
                 }
-                if s["status"]["renderFeedback"]["frameGeneration"]["canRetry"] == true
-                    && btn(ui, "重试补帧引擎（重新连接）", can_play(s) && !self.draft.contains_key("frameGeneration") && !self.draft.contains_key("frameGenerationBackend"))
-                {
-                    cmd(out, "retry-frame-generation", json!({}));
-                }
-            }
-            self.setting_choice(
-                ui,
-                s,
-                "frameGenerationBackend",
-                "补帧引擎",
-                &[
-                    ("dlssg", "DLSS 帧生成"),
-                    ("nvidia", "NVIDIA 视频补帧"),
-                    ("warp", "光流补帧"),
-                ],
-            );
-            self.setting_choice(
-                ui,
-                s,
-                "frameGenerationMultiplier",
-                "倍率",
-                &[("2", "2×"), ("3", "3×"), ("4", "4×")],
-            );
-            self.setting_choice(
-                ui,
-                s,
-                "frameDedup",
-                "重复帧",
-                &[
-                    ("off", "关闭"),
-                    ("auto", "自动识别"),
-                    ("60-to-30", "60 → 30 后补帧"),
-                ],
-            );
-            if s["publicRuntime"] == true {
-                note(ui, "倍率以去重后的源画面为基准；重复帧识别不会自动提高所选倍率，显示刷新率不足时会降低实际输出。");
-            }
-        });
+            });
         self.apply(ui, Tab::Picture, s, out);
     }
     fn controls(&mut self, ui: &mut Ui, s: &Value, out: &mut Actions) {
@@ -1835,6 +1853,17 @@ impl Panels {
             row(ui, "画面来源", |ui| {
                 ui.label(source);
             });
+            if let Some(hdr) = stats["inputHdr"].as_bool() {
+                row(ui, "色彩处理", |ui| {
+                    ui.label(match strval(stats, "hdrPreconversion") {
+                        "active" => "HDR → SDR → 增强",
+                        "error" => "HDR 转 SDR 失败",
+                        "required" => "HDR 输入；增强需转 SDR",
+                        _ if hdr => "HDR",
+                        _ => "SDR",
+                    });
+                });
+            }
             let capture_state = strval(stats, "captureState");
             for (label, wk, hk, fk, show) in [
                 ("视频输入", "width", "height", "fps", true),
@@ -1991,6 +2020,38 @@ impl Panels {
 mod tests {
     use super::*;
     #[test]
+    fn diagnostic_rows_wrap_chinese_and_device_ids_within_panel() {
+        for width in [260.0, 364.0, 520.0] {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 900.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let bound = ui.max_rect().right();
+                    let mut bottom = ui.cursor().top();
+                    for text in [
+                        "当前视频输入需要先转换色彩空间才能使用所选补帧与超分辨率引擎，请选择转换到标准动态范围输出。".repeat(3),
+                        "HID\\VID_054C&PID_0CE6\\".repeat(8),
+                    ] {
+                        let mut value = egui::Rect::NOTHING;
+                        row(ui, "运行状态", |ui| { value = ui.label(text).rect; });
+                        assert!(value.right() <= bound + 1.0, "value escaped panel at {width}");
+                        assert!(value.height() > ui.text_style_height(&egui::TextStyle::Body) * 2.0);
+                        assert!(value.top() >= bottom);
+                        bottom = value.bottom();
+                    }
+                    let next = ui.label("下一项").rect;
+                    assert!(next.top() >= bottom, "wrapped rows overlapped following text");
+                });
+            });
+        }
+    }
+    #[test]
     fn applying_camera_edits_preserves_other_tabs_and_quick_nr() {
         let s = json!({"settings":{"captureFps":0,"saturation":1,"neuralRendering":false}});
         let mut p = Panels::default();
@@ -2143,10 +2204,11 @@ mod tests {
         state: &Value,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, Actions) {
+        ctx.style_mut(|style| style.animation_time = 0.0);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(364., 1500.),
+                egui::vec2(364., 2200.),
             )),
             events,
             ..Default::default()
@@ -2204,6 +2266,10 @@ mod tests {
         draw_panel(ctx, p, tab, s, vec![button(false)]).1
     }
     fn click_nr(ctx: &egui::Context, p: &mut Panels, s: &Value) -> Actions {
+        let picture = draw_panel(ctx, p, Tab::Picture, s, vec![]).0;
+        if !text_labels(&picture).contains(&"启用 DLSS 5 NR") {
+            assert!(click_label(ctx, p, Tab::Picture, s, "神经渲染（NR）").is_empty());
+        }
         click_label(ctx, p, Tab::Picture, s, "启用 DLSS 5 NR")
     }
     #[test]
@@ -2299,9 +2365,7 @@ mod tests {
                 let raw = text_labels(&d);
                 assert!(raw.contains(&"支持") && raw.contains(&"不可启用"));
                 let d = draw_panel(&ctx, &mut p, Tab::Picture, &state, vec![]).0;
-                assert!(
-                    text_labels(&d).contains(&"保存的 NR 偏好仍在，当前不能启用；可关闭此开关。")
-                );
+                assert!(text_labels(&d).contains(&"当前无法启用 NR。"));
             }
             assert_eq!(
                 click_nr(&ctx, &mut p, &state),

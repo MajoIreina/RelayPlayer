@@ -138,7 +138,7 @@ function File-Digest([string]$Path){
 }
 $manifestPath=Child-Path ([IO.Path]::GetDirectoryName($root)) 'tools/relay-render-manifest.json'
 Assert-Unlinked $manifestPath
-if((File-Digest $manifestPath) -cne '25336f9a3d37f81181c75eea823922cf293902f02df3ef2cf676a4a7d76481e2'){throw 'Native manifest failed verification.'}
+if((File-Digest $manifestPath) -cne 'd5edc8c7445e2427e2f55caabbe9dcad3fdba70a134002114019d318b3207c9c'){throw 'Native manifest failed verification.'}
 $manifest=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 function Verify-Native([string]$Path){
  Assert-Unlinked $Path
@@ -172,7 +172,7 @@ try{
  while(!$lock){Assert-Preparing;try{$lock=[IO.File]::Open($lockPath,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch [IO.IOException]{if(($_.Exception.HResult -band 0xffff) -notin @(32,33)){throw};Report 'waiting' 0 1;if($cancelEvent){[void]$cancelEvent.WaitOne(250)}else{[Threading.Thread]::Sleep(250)}}}
  if([IO.Directory]::Exists($target)){Verify-Native $target;Report 'ready' 1 1;return}
  $overlay=Child-Path ([IO.Path]::GetDirectoryName($root)) 'runtime/relay-render-overlay.zip';Assert-Unlinked $overlay
- if((Get-Item -LiteralPath $overlay).Length -ne 24797058 -or (File-Digest $overlay) -cne '048e6e1c25559b3669240dfd5a522786629d4dded750d6cb4843aded07c10a23'){throw 'Native renderer bundle failed verification.'}
+ if((Get-Item -LiteralPath $overlay).Length -ne 24800808 -or (File-Digest $overlay) -cne '9c2095fe6c0a3169684e314a91dbbfbc898136d8d5aee2c879ac708abc36e574'){throw 'Native renderer bundle failed verification.'}
  $stage=Child-Path $root ('.relay-render-stage-'+[Guid]::NewGuid().ToString('N'));[void][IO.Directory]::CreateDirectory($stage)
  Copy-Tree (Child-Path $root 'chiaki-nr') $stage
  Add-Type -AssemblyName System.IO.Compression.FileSystem

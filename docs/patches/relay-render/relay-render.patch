@@ -61,7 +61,7 @@ index 908d938..c061aa4 100644
 \ No newline at end of file
 +IDI_ICON1 ICON DISCARDABLE "relay.ico"
 diff --git a/gui/include/qmlmainwindow.h b/gui/include/qmlmainwindow.h
-index 18568fa..a0346be 100644
+index 18568fa..6c4de39 100644
 --- a/gui/include/qmlmainwindow.h
 +++ b/gui/include/qmlmainwindow.h
 @@ -1,7 +1,9 @@
@@ -90,7 +90,7 @@ index 18568fa..a0346be 100644
      void updateWindowType(WindowType type);
      void setSettings(Settings *new_settings);
  
-@@ -185,6 +189,33 @@ public:
+@@ -185,6 +189,36 @@ public:
      Q_INVOKABLE void setStatsOverlayLayout(int style, int position);
      Q_INVOKABLE void noteLoadingTransitionComplete();
      Q_INVOKABLE void presentStartupWarmupFrame(unsigned width, unsigned height, bool hdr);
@@ -113,7 +113,10 @@ index 18568fa..a0346be 100644
 +    quint64 relay_revision = 0;
 +    QAtomicInteger<quint64> relay_applied_revision = 0;
 +    bool relay_parameters_valid = false;
-+    pl_tex relay_target_texture=nullptr,relay_spatial_texture=nullptr;
++    pl_tex relay_target_texture=nullptr,relay_spatial_texture=nullptr,relay_sdr_texture=nullptr;
++    pl_frame relay_sdr_frame={};
++    quint64 relay_sdr_serial=0,relay_sdr_revision=0;
++    QAtomicInteger<int> relay_hdr_state=0,relay_input_is_hdr=0;
 +    QAtomicInteger<int> relay_upscaler_state=0,relay_filter_state=0,relay_upscaler_reason=0;
 +    quint64 relay_frame_index = 0;
 +    QAtomicInteger<int> relay_source_width=0,relay_source_height=0,relay_output_width=0,relay_output_height=0;
@@ -384,13 +387,14 @@ index 25af475..c723382 100644
  	uint32_t stream_menu_shortcut1 = settings->GetStreamMenuShortcut1();
  	if(stream_menu_shortcut1 > 0)
 diff --git a/gui/src/qmlmainwindow.cpp b/gui/src/qmlmainwindow.cpp
-index f435a16..9d3c0e0 100644
+index f435a16..4914ce6 100644
 --- a/gui/src/qmlmainwindow.cpp
 +++ b/gui/src/qmlmainwindow.cpp
-@@ -1,3 +1,10 @@
+@@ -1,3 +1,11 @@
 +#include "relayfilters.h"
 +#include "relaytelemetry.h"
 +#include "relaypolicy.h"
++#include "relayhdr.h"
 +#include "relaycapture.h"
 +#include <QJsonDocument>
 +#include <QFile>
@@ -398,7 +402,7 @@ index f435a16..9d3c0e0 100644
  #include "qmlmainwindow.h"
  #include "rtxvsr.h"
  #include "neuralrender.h"
-@@ -7,6 +14,8 @@
+@@ -7,6 +15,8 @@
  #include "chiaki/log.h"
  #include "chiaki/time.h"
  #include "streamsession.h"
@@ -407,7 +411,7 @@ index f435a16..9d3c0e0 100644
  
  #include <qpa/qplatformnativeinterface.h>
  
-@@ -2727,6 +2736,7 @@ QmlMainWindow::QmlMainWindow(const StreamSessionConnectInfo &connect_info)
+@@ -2727,6 +2737,7 @@ QmlMainWindow::QmlMainWindow(const StreamSessionConnectInfo &connect_info)
  
  QmlMainWindow::~QmlMainWindow()
  {
@@ -415,17 +419,19 @@ index f435a16..9d3c0e0 100644
      Q_ASSERT(!placebo_swapchain);
  
      if (stats_overlay_widget) {
-@@ -2851,6 +2861,9 @@ QmlMainWindow::~QmlMainWindow()
+@@ -2851,6 +2862,11 @@ QmlMainWindow::~QmlMainWindow()
      rtx_vsr = nullptr;
      delete neural_render;
      neural_render = nullptr;
 +    if(relay_target_texture) pl_tex_destroy(placeboGpu(), &relay_target_texture);
++    if(relay_sdr_texture) pl_tex_destroy(placeboGpu(), &relay_sdr_texture);
++    relay_sdr_frame={};relay_sdr_serial=0;relay_sdr_revision=0;
 +    if(relay_spatial_texture) pl_tex_destroy(placeboGpu(), &relay_spatial_texture);
 +    pl_mpv_user_shader_destroy(&relay_filter_hook);pl_mpv_user_shader_destroy(&relay_artcnn_hook);
      pl_renderer_destroy(&placebo_renderer);
      // User shader hooks hold a reference to the GPU (their descriptors destroy
      // buffers/textures via p->gpu), so they must be released before the GPU is.
-@@ -2989,6 +3002,7 @@ void QmlMainWindow::setOverlayInteractionActive(bool active)
+@@ -2989,6 +3005,7 @@ void QmlMainWindow::setOverlayInteractionActive(bool active)
  
  void QmlMainWindow::setStatsOverlayActive(bool active)
  {
@@ -433,7 +439,7 @@ index f435a16..9d3c0e0 100644
      const bool previous = stats_overlay_visible;
      stats_overlay_visible = active;
      if (stats_overlay_widget)
-@@ -3071,7 +3085,8 @@ void QmlMainWindow::setSettings(Settings *new_settings)
+@@ -3071,7 +3088,8 @@ void QmlMainWindow::setSettings(Settings *new_settings)
  
  void QmlMainWindow::show()
  {
@@ -443,7 +449,7 @@ index f435a16..9d3c0e0 100644
      if (!component.isReady()) {
          qCCritical(chiakiGui) << "Component not ready\n" << component.errors();
          QMetaObject::invokeMethod(QGuiApplication::instance(), &QGuiApplication::quit, Qt::QueuedConnection);
-@@ -3086,12 +3101,31 @@ void QmlMainWindow::show()
+@@ -3086,12 +3104,31 @@ void QmlMainWindow::show()
          QMetaObject::invokeMethod(QGuiApplication::instance(), &QGuiApplication::quit, Qt::QueuedConnection);
          return;
      }
@@ -475,7 +481,7 @@ index f435a16..9d3c0e0 100644
      auto screen_size = QGuiApplication::primaryScreen()->availableSize();
      resize(screen_size);
  
-@@ -3201,11 +3235,15 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
+@@ -3201,11 +3238,15 @@ void QmlMainWindow::presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, q
  
      if (!frame.frame)
          return;
@@ -493,7 +499,7 @@ index f435a16..9d3c0e0 100644
          if (fg_source_cadence.fetchAndStoreRelaxed(cadence) != cadence) {
              qCInfo(chiakiGui).nospace() << "Source cadence: "
                  << (cadence == 2 ? "every picture repeated (e.g. 30 fps game in a 60 fps stream)"
-@@ -5000,6 +5038,11 @@ void QmlMainWindow::doneOpenGLContextCurrent()
+@@ -5000,6 +5041,11 @@ void QmlMainWindow::doneOpenGLContextCurrent()
  
  void QmlMainWindow::init(Settings *settings, bool exit_app_on_stream_exit)
  {
@@ -505,7 +511,7 @@ index f435a16..9d3c0e0 100644
      bypass_frame_queue = settings->GetDirectFrameMapping();
      render_backend = settings->GetRenderBackend();
      setSurfaceType(render_backend == RenderBackend::Vulkan ? QWindow::VulkanSurface : QWindow::OpenGLSurface);
-@@ -5337,7 +5380,17 @@ renderer_backend_ready:
+@@ -5337,7 +5383,17 @@ renderer_backend_ready:
      connect(qml_engine, &QQmlEngine::quit, this, &QWindow::close);
  
      backend = new QmlBackend(settings, this);
@@ -524,7 +530,7 @@ index f435a16..9d3c0e0 100644
      connect(backend, &QmlBackend::sessionChanged, this, [this, exit_app_on_stream_exit](StreamSession *s) {
          const bool preserve_startup_warmup = s && startup_warmup_preserve_next_session_change;
          startup_warmup_preserve_next_session_change = false;
-@@ -5448,7 +5501,7 @@ renderer_backend_ready:
+@@ -5448,7 +5504,7 @@ renderer_backend_ready:
              quick_need_render.storeRelaxed(1);
              setStreamMaxFPS(60);
              setStreamWindowAdjustable(false);
@@ -533,7 +539,7 @@ index f435a16..9d3c0e0 100644
              {
                  if(!this->settings->GetGeometry().isEmpty())
                  {
-@@ -6702,6 +6755,10 @@ void QmlMainWindow::handleVulkanRendererFallback(const QString &title, const QSt
+@@ -6702,6 +6758,10 @@ void QmlMainWindow::handleVulkanRendererFallback(const QString &title, const QSt
              backend->stopSession(false);
          }
  
@@ -544,7 +550,7 @@ index f435a16..9d3c0e0 100644
          QProcess process;
          process.setProgram(QCoreApplication::applicationFilePath());
          process.setArguments(QCoreApplication::arguments().mid(1));
-@@ -6718,6 +6775,7 @@ void QmlMainWindow::handleVulkanRendererFallback(const QString &title, const QSt
+@@ -6718,6 +6778,7 @@ void QmlMainWindow::handleVulkanRendererFallback(const QString &title, const QSt
  
  void QmlMainWindow::render()
  {
@@ -552,7 +558,7 @@ index f435a16..9d3c0e0 100644
      Q_ASSERT(QThread::currentThread() == render_thread);
      if (vulkan_device_lost.loadAcquire() != 0) {
          QMutexLocker locker(&render_schedule_mutex);
-@@ -6989,6 +7047,7 @@ void QmlMainWindow::render()
+@@ -6989,6 +7050,7 @@ void QmlMainWindow::render()
                  qCInfo(chiakiGui) << "Updated custom render parameters with one or more invalid parameters.";
              else
                  qCInfo(chiakiGui) << "Updated custom render parameters successfully.";
@@ -560,7 +566,7 @@ index f435a16..9d3c0e0 100644
          }
          render_params = &(this->renderparams_opts->params);
          break;
-@@ -7392,6 +7451,8 @@ void QmlMainWindow::render()
+@@ -7392,6 +7454,8 @@ void QmlMainWindow::render()
      // Submit immediately and let the swapchain / render path enforce pacing.
      auto close_started_frame = [this, timer_owned_playback, present_interval_us, start_frame_us, depth_limit, pending_frame_waiting, pending_overflow_waiting, snapshotQueueDepth, snapshotRenderScheduleState, present_submit_interval_s](bool present) -> bool {
          const qint64 submit_ready_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
@@ -569,7 +575,7 @@ index f435a16..9d3c0e0 100644
          const int queue_depth_now = snapshotQueueDepth();
          if (detailedVerboseTelemetryEnabled()) {
              static qint64 last_present_trace_log_us = 0;
-@@ -7609,6 +7670,10 @@ void QmlMainWindow::render()
+@@ -7609,6 +7673,10 @@ void QmlMainWindow::render()
      }
      if (!hint_frame && frame_mix.num_frames)
          hint_frame = frame_mix.frames[0];
@@ -580,7 +586,7 @@ index f435a16..9d3c0e0 100644
      struct pl_color_space hint = hint_frame ? hint_frame->color : pl_color_space{};
      struct pl_color_space target_csp = sw_frame.color_space;
      if (target_csp.hdr.max_luma <= 0.0f) {
-@@ -7695,8 +7760,12 @@ void QmlMainWindow::render()
+@@ -7695,8 +7763,12 @@ void QmlMainWindow::render()
          .parts = &overlay_part,
          .num_parts = 1,
      };
@@ -595,7 +601,16 @@ index f435a16..9d3c0e0 100644
      if(target_prim)
      {
          target_frame.color.primaries = static_cast<pl_color_primaries>(target_prim);
-@@ -7810,7 +7879,7 @@ void QmlMainWindow::render()
+@@ -7706,7 +7778,7 @@ void QmlMainWindow::render()
+     if(target_trc)
+         target_frame.color.transfer = static_cast<pl_color_transfer>(target_trc);
+ 
+-    if(target_peak && !target_frame.color.hdr.max_luma)
++    if(target_peak)
+     {
+         target_frame.color.hdr.max_luma = target_peak;
+     }
+@@ -7810,7 +7882,7 @@ void QmlMainWindow::render()
              if (render_entry_us_local > 0 && render_after_us >= render_entry_us_local)
                  logLatencyStats("render_work", render_after_us - render_entry_us_local);
          }
@@ -604,7 +619,7 @@ index f435a16..9d3c0e0 100644
          bool scheduled_pending = finalize_render();
          if (!scheduled_pending)
              schedulePostRenderWork();
-@@ -7853,6 +7922,29 @@ void QmlMainWindow::render()
+@@ -7853,6 +7925,29 @@ void QmlMainWindow::render()
      }
  #endif
  
@@ -634,7 +649,7 @@ index f435a16..9d3c0e0 100644
      const struct pl_hook *fsrcnnx_hook = nullptr;
      if (hint_frame) {
          const float src_width = fabsf(pl_rect_w(hint_frame->crop));
-@@ -7865,10 +7957,13 @@ void QmlMainWindow::render()
+@@ -7865,10 +7960,13 @@ void QmlMainWindow::render()
                                                 fsr_hook, fsrcnnx_hook_8, fsrcnnx_hook_16);
          }
      }
@@ -649,7 +664,35 @@ index f435a16..9d3c0e0 100644
      // AMD RCAS on the final image: after scaling, RTX VSR and frame
      // generation, so it also sharpens 1:1 output.
      const int rcas_strength = has_settings ? settings->GetRcasStrength() : 0;
-@@ -8005,22 +8100,13 @@ void QmlMainWindow::render()
+@@ -7934,6 +8032,27 @@ void QmlMainWindow::render()
+         }
+     }
+ 
++    // BT.2390 output must be converted before VSR / FG see the source. The
++    // original HDR input remains mapped for cadence detection and telemetry.
++    bool relay_sdr_failed=false;
++    if (!fg_override && bypass_frame_queue && direct_render_frame.num_planes>0) {
++        const bool needs_sdr=has_settings && (settings->GetFrameGenBackend()>0 || settings->GetRtxVsrQuality()>0);
++        const bool convert=relay_input_hdr && needs_sdr && relay_settings.value("toneMapMode").toString()=="bt2390-sdr";
++        int hdr_state=relay_input_hdr && needs_sdr?2:0;
++        if (convert) {
++            bool ready=relay_sdr_texture && relay_sdr_serial==direct_frame_serial && relay_sdr_revision==relay_revision;
++            if (!ready) {
++                ready=relayHdrToSdr(placeboGpu(),placebo_renderer,direct_render_frame,&relay_sdr_texture,&relay_sdr_frame);
++                relay_sdr_serial=ready?direct_frame_serial:0;
++                relay_sdr_revision=ready?relay_revision:0;
++            }
++            if (ready) {direct_render_frame=relay_sdr_frame;hdr_state=1;}
++            else {relay_sdr_failed=true;hdr_state=3;}
++        }
++        relay_hdr_state.storeRelaxed(hdr_state);
++        relay_input_is_hdr.storeRelaxed(relay_input_hdr?1:0);
++    }
++
+     // DLSS neural rendering (DLSS 5 through the NGX D3D12 bridge; NeuralHub on AMD):
+     // replace each source frame with a neural rendered RGB frame, at its own size or
+     // upscaled 1.5x / 2x toward the window, before RTX VSR and frame generation, which
+@@ -8005,22 +8124,13 @@ void QmlMainWindow::render()
      // How many frames frame generation makes per source picture: the multiplier asked for,
      // held back by the display. Also sets the status note on what the display holds back.
      auto plan_fg_multiplier = [&](int cadence, double source_interval_s, double refresh_hz) {
@@ -678,7 +721,16 @@ index f435a16..9d3c0e0 100644
      };
      // Pipelined frame generation: start the stream frame taken above (fg_pipe_stage). Its
      // DLSS 5 (or, without it, its DLSS FG) is queued on D3D12 now; the rest follows in
-@@ -8127,6 +8213,27 @@ void QmlMainWindow::render()
+@@ -8044,7 +8154,7 @@ void QmlMainWindow::render()
+                                    !nr_will_upscale;
+         // Fewer than 2 frames, RTX VSR, or a failure: the frame stays Taken and goes down the
+         // normal path once the last stream frame's frames are out.
+-        if (vsr_would_run) {
++        if (vsr_would_run || relay_input_hdr) {
+             fg_pipe_allowed = false;
+         } else if (multiplier >= 2 && frame_gen->backend() == FrameGen::Backend::Dlss12) {
+             fg_pipe_multiplier = multiplier;
+@@ -8127,6 +8237,27 @@ void QmlMainWindow::render()
          nr_status_hdr.storeRelaxed(nr_applied && nr_hdr ? 1 : 0);
      }
  
@@ -706,16 +758,57 @@ index f435a16..9d3c0e0 100644
      // RTX Video Super Resolution: replace each source frame with an NVIDIA
      // upscaled RGB frame at the output size, so libplacebo only color maps it
      // and scales it ~1:1. Any failure keeps the regular libplacebo path.
-@@ -8265,7 +8372,7 @@ void QmlMainWindow::render()
+@@ -8212,7 +8343,9 @@ void QmlMainWindow::render()
+         }
+     }
+     bool fg_applied = fg_override;
+-    if (!fg_override && direct_frame_fresh && fg_run_backend > 0 && stream_active && direct_render_frame.num_planes > 0) {
++    const bool relay_fg_hdr=direct_render_frame.num_planes>0 && pl_color_space_is_hdr(&direct_render_frame.color);
++    bool relay_fg_attempted=false;
++    if (!fg_override && direct_frame_fresh && fg_run_backend > 0 && stream_active && direct_render_frame.num_planes > 0 && !relay_fg_hdr) {
+         const auto backend_choice = static_cast<FrameGen::Backend>(fg_run_backend);
+         // With repeats dropped a picture lasts `cadence` stream frames; the
+         // multiplier stays relative to the stream rate, so output fps is kept.
+@@ -8247,6 +8380,7 @@ void QmlMainWindow::render()
+             frame_gen->setDlssMotion(settings->GetFrameGenDlssMotion());
+             frame_gen->setCleanup(settings->GetFrameGenCleanup());
+             frame_gen->setVfgMode(settings->GetFrameGenVfgMode());
++            relay_fg_attempted=multiplier>=2;
+             if (multiplier >= 2 &&
+                 frame_gen->process(&direct_render_frame, fg_out_w, fg_out_h, multiplier,
+                                    static_cast<float>(source_interval_s * 1000.0), fg_outputs) &&
+@@ -8265,7 +8399,7 @@ void QmlMainWindow::render()
                  fg_active_cadence = cadence;
                  fg_applied = true;
                  // RTX VSR has no split into a D3D12 half, so it keeps the frames unpipelined.
 -                fg_pipe_allowed = backend_choice == FrameGen::Backend::Dlss12 && !vsr_applied;
-+                fg_pipe_allowed = backend_choice == FrameGen::Backend::Dlss12 && !vsr_applied && !relay_spatial_applied;
++                fg_pipe_allowed = backend_choice == FrameGen::Backend::Dlss12 && !vsr_applied && !relay_spatial_applied && !relay_input_hdr;
              }
          }
      }
-@@ -8321,8 +8428,12 @@ void QmlMainWindow::render()
+@@ -8304,12 +8438,20 @@ void QmlMainWindow::render()
+         fg_status_backend.storeRelaxed(stream_active ? fg_run_backend : 0);
+         fg_status_multiplier.storeRelaxed(fg_applied ? fg_active_multiplier : 0);
+         int reason = 0;
+-        if (!bypass_frame_queue)
++        if (fg_backend<=0 || fg_applied)
++            reason = 0;
++        else if (!bypass_frame_queue)
+             reason = 1;
++        else if (relay_sdr_failed)
++            reason = 5;
++        else if (relay_fg_hdr)
++            reason = 4;
+         else if (fg_run_backend > 0 && frame_gen->backendFailed(static_cast<FrameGen::Backend>(fg_run_backend)))
+             reason = 2;
+         else if (fg_backend > 0 && fg_refresh_limited)
+             reason = 3;
++        else if (relay_fg_attempted)
++            reason = 6;
+         fg_status_reason.storeRelaxed(reason);
+         if (reason == 1 && fg_backend > 0 && fg_skip_logged != 1) {
+             fg_skip_logged = 1;
+@@ -8321,8 +8463,12 @@ void QmlMainWindow::render()
          // The frame already is at display size; skip the shader upscalers
          // but keep RCAS, which sharpens the final image.
          const bool rcas_active = num_active_hooks > 0 && active_hooks[num_active_hooks - 1] == rcas_hook;
@@ -730,7 +823,7 @@ index f435a16..9d3c0e0 100644
      }
      // Generated frames reuse the last stream frame's VSR state.
      if (!fg_override) {
-@@ -8374,6 +8485,52 @@ void QmlMainWindow::render()
+@@ -8374,6 +8520,53 @@ void QmlMainWindow::render()
                  logLatencyStats("render_work", render_after_us - render_entry_us_local);
          }
      }
@@ -749,7 +842,8 @@ index f435a16..9d3c0e0 100644
 +        const bool failed=vsr?(!nvidia_card || !rtx_vsr || rtx_vsr->modeFailed(rtx_vsr_quality)):
 +            (chosen=="artcnn"?!hookOk(relay_artcnn_hook):chosen=="fsr1"?!hookOk(fsrcnnx_hook):false);
 +        relay_upscaler_reason.storeRelaxed(relayUpscalerStatus(chosen!="off",actual!=0,
-+            relay_input_width>0,relay_scaling,vsr,relay_input_hdr,failed,nr_upscaled));
++            relay_input_width>0,relay_scaling,vsr,relay_input_hdr && relay_hdr_state.loadRelaxed()!=1,failed,nr_upscaled));
++        if(vsr && relay_sdr_failed)relay_upscaler_reason.storeRelaxed(8);
 +    }
 +    relay_filter_state.storeRelaxed((relay_exposure.get() || hookOk(relay_filter_hook))?1:0);
 +    if(nr_status_state.loadRelaxed()==1)relay_nr_confirmed.storeRelease(1);
@@ -783,7 +877,7 @@ index f435a16..9d3c0e0 100644
      close_started_frame(true);
  
      if (startup_video_visible_refresh_pending.loadAcquire() != 0) {
-@@ -8448,6 +8605,7 @@ void QmlMainWindow::fgPipeAdvance(bool drain)
+@@ -8448,6 +8641,7 @@ void QmlMainWindow::fgPipeAdvance(bool drain)
  
  bool QmlMainWindow::handleShortcut(QKeyEvent *event)
  {
@@ -791,7 +885,7 @@ index f435a16..9d3c0e0 100644
      if (event->modifiers() == Qt::NoModifier) {
          switch (event->key()) {
          case Qt::Key_F11:
-@@ -8675,3 +8833,237 @@ QObject *QmlMainWindow::focusObject() const
+@@ -8675,3 +8869,258 @@ QObject *QmlMainWindow::focusObject() const
  {
      return quick_window->focusObject();
  }
@@ -816,7 +910,11 @@ index f435a16..9d3c0e0 100644
 + st["frameGenerationSourceFps"]=stream_fps/qMax(1,fg_source_cadence.loadRelaxed());
 + const int fg_reason=fg_status_reason.loadRelaxed();
 + st["frameGenerationReasonCode"]=fg_reason;
-+ st["frameGenerationReason"]=fg_reason==1?"需要直接帧映射":fg_reason==2?"显卡、驱动或运行库无法启动所选补帧引擎":fg_reason==3?"显示器刷新率不足，请降低源帧率或选择 60→30 后补帧":"";
++ st["frameGenerationReason"]=fg_reason==1?"需要直接帧映射":fg_reason==2?"补帧引擎启动失败，可重试连接":fg_reason==3?"刷新率不足，请降低源帧率":fg_reason==4?"补帧仅支持 SDR；请选择 BT.2390 转 SDR":fg_reason==5?"HDR 转 SDR 失败，补帧暂未启用":fg_reason==6?"补帧处理未完成，可重试连接":"";
++ const int hdr_state=relay_hdr_state.loadRelaxed();
++ st["inputHdr"]=relay_input_is_hdr.loadRelaxed()!=0;
++ st["enhancementInput"]=hdr_state==1?"sdr-bt2390":relay_input_is_hdr.loadRelaxed()!=0?"hdr":"sdr";
++ st["hdrPreconversion"]=hdr_state==1?"active":hdr_state==3?"error":hdr_state==2?"required":"off";
 + st["fps"]=stream_fps;st["outputFps"]=display_fps;
 + st["displayFps"]=display_fps;
 + st["width"]=relay_source_width.loadRelaxed();st["height"]=relay_source_height.loadRelaxed();
@@ -846,11 +944,11 @@ index f435a16..9d3c0e0 100644
 + const int up_reason=relay_upscaler_reason.loadRelaxed();
 + st["upscalerState"]=up_reason==0?"off":up_reason==1?"active":up_reason==2?"waiting":up_reason==3?"no-scaling":(up_reason==4 || up_reason==7)?"suspended":"error";
 + st["upscalerReasonCode"]=up_reason;
-+ st["upscalerReason"]=up_reason==4?"当前 RTX 视频超分实现仅处理 SDR 输入；请关闭串流 HDR 或选择 ArtCNN / FSR。输出端转 SDR 不会改变超分的输入。":
++ st["upscalerReason"]=up_reason==4?"RTX 超分仅支持 SDR；请选择 BT.2390 转 SDR":
 +     up_reason==5?"所选超分引擎初始化或处理失败；可重试以重新连接并重建引擎。":
 +     up_reason==6?"本次画面未完成所选超分处理；持续出现时可重试引擎。":
-+     up_reason==7?"神经渲染已完成放大，所选超分未重复执行。":"";
-+ st["upscalerUnavailable"]=up_reason==5 || up_reason==6;
++     up_reason==7?"神经渲染已完成放大":up_reason==8?"HDR 转 SDR 失败，超分暂未启用":"";
++ st["upscalerUnavailable"]=up_reason==5 || up_reason==6 || up_reason==8;
 + auto driver=QString::fromUtf8(vk_device_driver_props.driverInfo).trimmed();
 + if(driver.isEmpty() && vk_device_props.driverVersion)driver=QStringLiteral("驱动编码 0x%1").arg(vk_device_props.driverVersion,8,16,QChar('0'));
 + const auto display=screen();
@@ -921,6 +1019,10 @@ index f435a16..9d3c0e0 100644
 + }
 + if(changed({"framePacing"}))settings->SetVSyncEnabled(text("framePacing","auto")=="smooth-vsync");
 + if(changed({"toneMapMode"})){
++ fg_pending_frames.clear();fgPipeCancel();fg_pipe_allowed=false;
++ fg_active_multiplier=1;fg_active_cadence=1;
++ if(frame_gen)frame_gen->reset();
++ relay_sdr_serial=0;relay_sdr_revision=0;
 + const auto tone=text("toneMapMode","auto");
 + settings->SetDisplayTargetTrc(tone=="bt2390-sdr"?PL_COLOR_TRC_BT_1886:tone=="hdr10-passthrough"?PL_COLOR_TRC_PQ:0);
 + settings->SetDisplayTargetPrim(tone=="bt2390-sdr"?PL_COLOR_PRIM_BT_709:tone=="hdr10-passthrough"?PL_COLOR_PRIM_BT_2020:0);
@@ -983,12 +1085,25 @@ index f435a16..9d3c0e0 100644
 +    auto timer=new QTimer(this);timer->setInterval(16);
 +    connect(timer,&QTimer::timeout,this,[this]{
 +        AVFrame *frame=av_frame_alloc();if(!frame)return;
-+        frame->format=AV_PIX_FMT_RGB24;frame->width=640;frame->height=360;
++        const bool hdr=qEnvironmentVariable("RELAY_RENDER_TEST_HDR")=="1";
++        frame->format=hdr?AV_PIX_FMT_RGB48LE:AV_PIX_FMT_RGB24;frame->width=640;frame->height=360;
 +        frame->color_range=AVCOL_RANGE_JPEG;frame->colorspace=AVCOL_SPC_RGB;
-+        frame->color_primaries=AVCOL_PRI_BT709;frame->color_trc=AVCOL_TRC_BT709;
++        frame->color_primaries=hdr?AVCOL_PRI_BT2020:AVCOL_PRI_BT709;
++        frame->color_trc=hdr?AVCOL_TRC_SMPTE2084:AVCOL_TRC_BT709;
 +        if(av_frame_get_buffer(frame,32)<0){av_frame_free(&frame);return;}
++        // Opt-in PQ encoded test pixels, never applied to a real stream.
++        static const auto pq=[]{
++            std::array<uint16_t,256> lut;
++            for(int i=0;i<256;i++){
++                double p=std::pow((1.0+1999.0*i/255.0)/10000.0,2610.0/16384.0);
++                lut[i]=static_cast<uint16_t>(65535.0*std::pow((3424.0/4096.0+2413.0/128.0*p)/(1.0+2392.0/128.0*p),2523.0/32.0));
++            }
++            return lut;
++        }();
 +        for(int y=0;y<frame->height;y++)for(int x=0;x<frame->width;x++){
-+            auto p=frame->data[0]+y*frame->linesize[0]+x*3;p[0]=32+x*200/640;p[1]=16+y*100/360;p[2]=220-x*160/640;
++            int rgb[3]={32+x*200/640,16+y*100/360,220-x*160/640};
++            if(hdr){auto p=reinterpret_cast<uint16_t*>(frame->data[0]+y*frame->linesize[0])+x*3;for(int c=0;c<3;c++)p[c]=pq[rgb[c]];}
++            else{auto p=frame->data[0]+y*frame->linesize[0]+x*3;for(int c=0;c<3;c++)p[c]=rgb[c];}
 +        }
 +        presentRelayCapture(frame,60);
 +    });timer->start();
@@ -1107,13 +1222,15 @@ index aefdedf..0355991 100755
  
  void StreamSession::QueueAudioOutData(const QByteArray &audio_data)
 diff --git a/gui/tools/fgdx12test.cpp b/gui/tools/fgdx12test.cpp
-index a4423b0..c294b75 100644
+index a4423b0..7bc5798 100644
 --- a/gui/tools/fgdx12test.cpp
 +++ b/gui/tools/fgdx12test.cpp
-@@ -1,3 +1,10 @@
+@@ -1,3 +1,12 @@
 +#include "relayfilters.h"
 +#include "relaytelemetry.h"
 +#include "relaypolicy.h"
++#include "relayhdr.h"
++#include "rtxvsr.h"
 +#include <QJsonDocument>
 +#include <libplacebo/options.h>
 +#include <libplacebo/shaders/custom.h>
@@ -1121,7 +1238,7 @@ index a4423b0..c294b75 100644
  // chiaki-fgdx12test: console test of chiaki-ng's frame generation backends, driven the way
  // the renderer drives them: synthetic frames of a moving pattern go through FrameGen::process
  // on a libplacebo Vulkan device, and the generated frames are read back and compared with
-@@ -639,9 +646,107 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
+@@ -639,9 +648,181 @@ int runNeuralRender(Rig &rig, const std::string &image_path, const std::string &
  
  } // namespace
  
@@ -1194,9 +1311,83 @@ index a4423b0..c294b75 100644
 + std::printf("RELAY_TELEMETRY_TEST %s\n",QJsonDocument(result).toJson(QJsonDocument::Compact).constData());
 + nr.destroy();return applied?0:15;
 +}
++int relayHdrTests()
++{
++    Rig r;
++    if (!r.init() || !r.resize(960,540) || !r.ensureHdrSource()) return 40;
++    RtxVsr vsr(r.log);
++    FrameGen fg(r.log);
++    pl_tex converted_tex=nullptr;
++    int failures=0;
++    auto pq=[](double nits){
++        double p=std::pow(nits/10000.0,2610.0/16384.0);
++        return float(std::pow((3424.0/4096.0+2413.0/128.0*p)/(1.0+2392.0/128.0*p),2523.0/32.0));
++    };
++    const float nits[]={0,10,50,203,1000,2000};
++    std::vector<uint16_t> pixels(r.w*r.h*4);
++    for(int y=0;y<r.h;y++)for(int x=0;x<r.w;x++){
++        int i=(y*r.w+x)*4;float v=pq(nits[std::min(5,x*6/r.w)]);
++        pixels[i]=pixels[i+1]=pixels[i+2]=floatToHalf(v);pixels[i+3]=floatToHalf(1);
++    }
++    r.uploadHalf(pixels.data());
++    auto hdr=r.hdrSourceFrame();hdr.color=pl_color_space_hdr10;hdr.color.hdr.max_luma=2000;
++    pl_frame sdr={};
++    bool converted=relayHdrToSdr(r.gpu,r.renderer,hdr,&converted_tex,&sdr);
++    if(!converted || pl_color_space_is_hdr(&sdr.color) || !pl_color_space_is_hdr(&hdr.color) || sdr.planes[0].texture==hdr.planes[0].texture)failures++;
++    std::vector<float> readback;
++    auto linear=pl_color_space_bt709;linear.transfer=PL_COLOR_TRC_LINEAR;linear.hdr.max_luma=PL_COLOR_SDR_WHITE;
++    bool color_ok=converted && r.readFloat(sdr,r.w,r.h,linear,readback);
++    float previous=-1;
++    if(color_ok)for(int band=0;band<6;band++){
++        float value=readback[((r.h/2)*r.w+(band*2+1)*r.w/12)*4];
++        std::printf("HDR_PREPASS input=%.0f_nits output=%.6f_SDR_white\n",nits[band],value);
++        if(!std::isfinite(value) || value<previous || value< -0.001 || value>1.005)color_ok=false;
++        if(band==0 && value>0.005)color_ok=false;
++        if(band==5 && (value<0.6 || value<=previous+0.005))color_ok=false;
++        previous=value;
++    }
++    std::printf("%s BT2390 PQ pixels, highlight compression and source preservation\n",color_ok?"PASS":"FAIL");
++    if(!color_ok)failures++;
++    bool engines=vsr.ensureInitialized(r.vk) && fg.ensureInitialized(r.vk,FrameGen::Backend::Dlss);
++    if(!engines)failures++;
++    if(engines){
++        pl_frame ignored={};uint64_t signature=0;std::vector<pl_frame> outputs;
++        bool skip=!vsr.process(&hdr,1,1920,1080,4,&ignored,&signature) && !fg.process(&hdr,1920,1080,2,16.67f,outputs);
++        std::printf("%s unconverted HDR remains rejected\n",skip?"PASS":"FAIL");if(!skip)failures++;
++        for(int k=0;k<5;k++){
++            std::vector<uint8_t> pattern_pixels(r.w*r.h*4);
++            for(int y=0;y<r.h;y++)for(int x=0;x<r.w;x++){
++                int i=(y*r.w+x)*4;pattern_pixels[i]=pattern_pixels[i+1]=pattern_pixels[i+2]=pattern(x,y,k*8);pattern_pixels[i+3]=255;
++            }
++            auto half=toHdrHalf(pattern_pixels,8);r.uploadHalf(half.data());
++            auto source=r.hdrSourceFrame();
++            pl_frame mapped={},upscaled={};
++            bool ok=relayHdrToSdr(r.gpu,r.renderer,source,&converted_tex,&mapped) &&
++                vsr.process(&mapped,100+k,1920,1080,4,&upscaled,&signature) &&
++                fg.process(&upscaled,1920,1080,2,16.67f,outputs) && !outputs.empty();
++            if(k>0)ok=ok && outputs.size()==2;
++            std::vector<uint8_t> out;
++            ok=ok && r.readRgba(outputs.back(),out);
++            double mean=0;
++            for(size_t i=0;i<out.size();i+=4)mean+=out[i]+out[i+1]+out[i+2];
++            mean/=std::max<size_t>(1,out.size()/4*3);
++            ok=ok && mean>10 && mean<245;
++            std::printf("%s HDR -> BT2390 -> VSR -> DLSS FG frame=%d outputs=%zu\n",ok?"PASS":"FAIL",k,outputs.size());
++            if(!ok)failures++;
++        }
++        // The same instances must accept a subsequent SDR source.
++        r.upload(64);auto source=r.sourceFrame();pl_frame upscaled={};
++        bool ok=vsr.process(&source,200,1920,1080,4,&upscaled,&signature) && fg.process(&upscaled,1920,1080,2,16.67f,outputs);
++        std::printf("%s SDR restored after HDR prepass\n",ok?"PASS":"FAIL");if(!ok)failures++;
++    }
++    fg.destroy();vsr.destroy();pl_tex_destroy(r.gpu,&converted_tex);r.destroy();
++    std::printf("RELAY_HDR_TEST failures=%d\n",failures);return failures?41:0;
++}
++
  int main(int argc, char **argv)
  {
      QCoreApplication app(argc, argv);
++    if(argc>1 && std::string(argv[1])=="--relay-hdr-test")return relayHdrTests();
 +    if(argc>1 && std::string(argv[1])=="--relay-policy-test"){
 +        int failures=0,cases=0;
 +        for(int requested:{2,3,4})for(int cadence:{1,2})for(int source_fps:{30,60})for(int hz:{60,120,144,240})for(int max:{2,3,4}){
@@ -1229,7 +1420,7 @@ index a4423b0..c294b75 100644
  #if defined(_WIN32)
      // 1 ms timer resolution, as chiaki-ng sets it while streaming (windowsStreamTuning.cpp): waits
      // for Streamline's frames sleep 1 ms at a time.
-@@ -814,3 +919,4 @@ int main(int argc, char **argv)
+@@ -814,3 +995,4 @@ int main(int argc, char **argv)
      std::printf("\nVERDICT: %s\n", failures == 0 ? "ALL PHASES PASSED" : "SOME PHASES FAILED, see above");
      return failures == 0 ? 0 : 1;
  }

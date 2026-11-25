@@ -51,3 +51,4 @@ struct RelayExposure {
  void set(double ev){gain=static_cast<float>(std::exp2(std::isfinite(ev)?qBound(-3.0,ev,3.0):0.0));}
  const struct pl_hook *get() const{return gain==1.0f?nullptr:&hook;}
 };
+
