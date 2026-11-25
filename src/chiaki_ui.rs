@@ -22,6 +22,7 @@ pub struct PublicPlayback {
     sent_at: Option<std::time::Instant>,
     last_error: String,
     remembered_connection: bool,
+    enhancement_recovery_required: bool,
     wake: Option<crate::wake::WakeTask>,
     gate: Option<StartGate>,
     pub snapshot: Value,
@@ -92,6 +93,7 @@ impl PublicPlayback {
             sent_at: None,
             last_error: String::new(),
             remembered_connection: false,
+            enhancement_recovery_required: false,
             wake: None,
             gate: None,
             snapshot: json!({}),
@@ -121,9 +123,49 @@ impl PublicPlayback {
             || (self.player.running()
                 && stats["revision"].as_u64().unwrap_or(0) < self.player.render_revision());
         let up = &self.settings["upscaler"];
+        let state = stats["upscalerState"].as_str().unwrap_or("waiting");
+        let retry = self.player.running() && !self.pending && !self.reconnect && !self.waking();
         json!({"pendingSettings":if pending{self.changed.clone()}else{Vec::new()},
-            "upscaler":{"requested":up,"actual":stats["activeUpscaler"],"state":if stats["upscalerUnavailable"]==true{"error"}else if up!="off" && stats["activeUpscaler"]=="off"{"no-scaling"}else{"active"},"reason":if stats["upscalerUnavailable"]==true{"当前显卡、驱动或运行库无法启用所选算法。"}else{""}},
+            "upscaler":{"requested":up,"actual":stats["activeUpscaler"],"state":state,"reason":stats["upscalerReason"],"canRetry":retry && up!="off" && state!="suspended"},
+            "frameGeneration":{"canRetry":retry && self.settings["frameGeneration"]==true},
             "bitrateLock":{"state":if self.settings["lockBitrate"]==true{if self.pending{"pending-reconnect"}else{"locked"}}else{"off"},"targetKbps":self.settings["bitrateKbps"]}})
+    }
+    // Restart the isolated renderer rather than re-entering a driver/runtime that failed.
+    // The existing reconnect path keeps the console awake and retains its paired target.
+    pub fn retry_enhancements(&mut self) -> io::Result<()> {
+        if !self.player.running()
+            || self.pending
+            || self.reconnect
+            || self.waking()
+            || (self.settings["upscaler"] == "off" && self.settings["frameGeneration"] != true)
+        {
+            return Err(io::Error::other(
+                "请在播放中启用超分或补帧后重试，并等待当前操作完成。",
+            ));
+        }
+        self.player.close_for_reconnect()?;
+        self.reconnect = true;
+        self.pending = true;
+        self.snapshot = json!({});
+        self.note = "正在重新连接并重建超分／补帧引擎；PS5 保持开机。".into();
+        Ok(())
+    }
+    pub fn settings_need_reconnect(&self, patch: &Value) -> bool {
+        self.player.running()
+            && patch.as_object().is_some_and(|o| {
+                o.iter().any(|(k, v)| {
+                    self.settings[k] != *v
+                        && (crate::playback::session_key(k)
+                            || (self.enhancement_recovery_required
+                                && matches!(
+                                    k.as_str(),
+                                    "upscaler"
+                                        | "upscalerQuality"
+                                        | "frameGeneration"
+                                        | "frameGenerationBackend"
+                                )))
+                })
+            })
     }
     pub fn connect(&mut self, args: &Value) -> io::Result<()> {
         if !self.connections.operation.is_empty()
@@ -136,6 +178,7 @@ impl PublicPlayback {
         self.connect_began = None;
         self.timings = json!({});
         self.snapshot = json!({});
+        self.enhancement_recovery_required = false;
         let gate = StartGate::new();
         let target = self.connections.target(args)?;
         let wake = crate::wake::WakeTask::start(&target)?;
@@ -219,11 +262,12 @@ impl PublicPlayback {
         let tmp = self.path.with_extension("tmp");
         fs::write(&tmp, next.to_string())?;
         fs::rename(tmp, &self.path)?;
-        let needs_reconnect = self.player.running()
-            && object
-                .iter()
-                .any(|(k, v)| crate::playback::session_key(k) && self.settings[k] != *v);
-        self.player.set_render_settings(&next)?;
+        let needs_reconnect = self.settings_need_reconnect(patch);
+        // Apply to the new process on reconnect. Do not send another algorithm call
+        // to the failed runtime while its shutdown is being requested.
+        if !needs_reconnect {
+            self.player.set_render_settings(&next)?;
+        }
         self.settings = next;
         self.changed = object.keys().cloned().collect();
         self.sent_at = Some(std::time::Instant::now());
@@ -279,6 +323,7 @@ impl PublicPlayback {
         };
         match update {
             Some(Update::Ready) => {
+                self.enhancement_recovery_required = false;
                 if self.devices || self.capture {
                     self.player.launch_capture(self.devices)?;
                     self.note = if self.devices {
@@ -367,6 +412,8 @@ impl PublicPlayback {
         }
         self.snapshot = self.player.render_feedback();
         let f = &self.snapshot;
+        self.enhancement_recovery_required |=
+            f["stats"]["upscalerState"] == "error" || f["stats"]["frameGenerationReasonCode"] == 2;
         if !self.capture && !self.remembered_connection && self.player.video_received() {
             self.remembered_connection = true;
             if let Some(began) = self.connect_began.take() {
@@ -463,6 +510,25 @@ mod tests {
             gate.runtime_ms = Some(3);
             assert!(gate.ready());
         }
+    }
+    #[test]
+    fn feedback_distinguishes_hdr_suspension_failure_and_missing_frames() {
+        let root =
+            std::env::temp_dir().join(format!("Relay-Enhancement-QA-{}", std::process::id()));
+        let mut p = PublicPlayback::new(root.clone(), root, true, None);
+        p.settings["upscaler"] = json!("rtx-vsr");
+        assert_eq!(p.feedback()["upscaler"]["state"], "waiting");
+        for state in ["suspended", "error", "no-scaling", "active"] {
+            p.snapshot = json!({"stats":{"upscalerState":state,"upscalerReason":"fixture reason","activeUpscaler":"off"}});
+            let feedback = p.feedback();
+            assert_eq!(feedback["upscaler"]["state"], state);
+            assert_eq!(feedback["upscaler"]["reason"], "fixture reason");
+            assert_eq!(feedback["upscaler"]["canRetry"], false);
+        }
+        let before = p.settings.clone();
+        assert!(p.retry_enhancements().is_err());
+        assert_eq!(p.settings, before);
+        assert!(!p.pending && !p.reconnect);
     }
     #[test]
     fn playback_settings_are_bounded_and_never_accept_credentials_or_fake_algorithms() {

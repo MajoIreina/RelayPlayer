@@ -9,6 +9,9 @@ mod backend;
 #[path = "chiaki.rs"]
 mod chiaki;
 #[allow(dead_code)]
+#[path = "chiaki_ui.rs"]
+mod chiaki_ui;
+#[allow(dead_code)]
 #[path = "connections.rs"]
 mod connections;
 #[path = "wake.rs"]
@@ -331,6 +334,7 @@ fn gui_fixture() -> Result<(), Box<dyn std::error::Error>> {
             "RELAY_RENDER {}",
             json!({"type":"stats","width":1920,"height":1080,
             "bitrateMbps":83.75,"displayFps":117.42,"frameGeneration":"5","frameGenerationMultiplier":2,
+            "upscalerState":"error","frameGenerationReasonCode":2,
             "pictureSource":"stream","gpu":{"adapterName":"Fixture GPU","driverVersion":"fixture-driver"}})
         );
         io::stdout().flush()?;
@@ -597,7 +601,14 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         let _ = fs::remove_file(dir.join(name));
     }
-    for action in ["stop", "reconnect", "shutdown", "unresponsive", "blocked"] {
+    for action in [
+        "stop",
+        "reconnect",
+        "enhancement-retry",
+        "shutdown",
+        "unresponsive",
+        "blocked",
+    ] {
         for name in ["fixture-started", "fixture-helper", "fixture-stop"] {
             let _ = fs::remove_file(dir.join(name));
         }
@@ -606,10 +617,11 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
             dir.join("fixture-mode"),
             if protocol { "protocol" } else { "unresponsive" },
         )?;
-        let mut player =
-            chiaki::Player::new(root.clone(), Some(profile.clone()), Some(zip.clone()));
+        let mut public =
+            chiaki_ui::PublicPlayback::new(root.clone(), profile.clone(), true, Some(zip.clone()));
+        let player = &mut public.player;
         player.begin_stream_fixture(PROVIDER_FIXTURE, PROFILE_FIXTURE)?;
-        assert!(matches!(wait_for_gui(&mut player)?, chiaki::Update::Ready));
+        assert!(matches!(wait_for_gui(player)?, chiaki::Update::Ready));
         player.launch_stream("测试 PS5 '$&", "127.0.0.1")?;
         let renderer = process_handle(await_pid(&dir.join("fixture-started")));
         let helper = process_handle(await_pid(&dir.join("fixture-helper")));
@@ -625,29 +637,46 @@ fn run_gui_contract() -> Result<(), Box<dyn std::error::Error>> {
             player.shutdown();
             assert!(!player.running());
         } else {
-            if action == "reconnect" {
+            if action == "enhancement-retry" {
+                public.poll()?;
+                assert!(public.settings_need_reconnect(&json!({"frameGenerationBackend":"nvidia"})));
+                assert!(public.settings_need_reconnect(&json!({"upscaler":"artcnn"})));
+                assert!(!public.settings_need_reconnect(&json!({"gamma":1.2})));
+                assert!(!public
+                    .settings_need_reconnect(&json!({"upscaler":public.settings["upscaler"]})));
+                let before = public.settings.clone();
+                public.settings["upscaler"] = json!("rtx-vsr");
+                public.snapshot = json!({"stats":{"upscalerState":"error"}});
+                assert_eq!(public.feedback()["upscaler"]["canRetry"], true);
+                public.retry_enhancements()?;
+                assert!(public.retry_enhancements().is_err());
+                assert_eq!(public.feedback()["upscaler"]["canRetry"], false);
+                assert!(public.snapshot["stats"].is_null());
+                assert_eq!(public.settings["hdr"], before["hdr"]);
+            } else if action == "reconnect" {
                 player.close_for_reconnect()?;
             } else {
                 player.close()?;
             }
+            let player = &mut public.player;
             assert!(
                 player.stopping()
                     && !player.video_received()
                     && player.render_feedback()["stats"].is_null()
             );
-            assert!(matches!(
-                wait_for_gui(&mut player)?,
-                chiaki::Update::Closed(_)
-            ));
+            assert!(matches!(wait_for_gui(player)?, chiaki::Update::Closed(_)));
         }
         assert!(stop_at.elapsed() < Duration::from_secs(3));
         assert_exited(&renderer);
         assert_exited(&helper);
         if protocol {
             let command: Value = serde_json::from_slice(&fs::read(dir.join("fixture-stop"))?)?;
-            assert_eq!(command["standby"], action != "reconnect");
+            assert_eq!(
+                command["standby"],
+                !matches!(action, "reconnect" | "enhancement-retry")
+            );
         }
-        assert!(player.render_feedback()["stats"].is_null());
+        assert!(public.player.render_feedback()["stats"].is_null());
     }
     for name in [
         "fixture-started",

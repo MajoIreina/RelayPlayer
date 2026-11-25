@@ -387,7 +387,7 @@ fn upscaler_frame_state(st: &Value, stats: &Value, requested: &str) -> Option<St
     if matches!(state, "suspended" | "error" | "no-scaling") {
         let message = match state {
             "suspended" => "所选超分已暂停",
-            "error" => "引擎未确认超分保护操作",
+            "error" => "所选超分处理失败",
             _ => "当前画面无需放大",
         };
         return Some(if reason.is_empty() {
@@ -1402,7 +1402,7 @@ impl Panels {
         if s["status"]["renderFeedback"]["upscaler"]["canRetry"].as_bool() == Some(true)
             && btn(
                 ui,
-                "重试所选超分算法",
+                "重试所选超分算法（重新连接）",
                 can_play(s) && !self.draft.contains_key("upscaler"),
             )
         {
@@ -1629,8 +1629,10 @@ impl Panels {
                     note(
                         ui,
                         format!(
-                            "实际补帧：{n}× · {}",
-                            strval(stats, "frameGenerationBackend")
+                            "实际补帧：{n}× · {} · 源 {:.1} fps → 输出 {:.1} fps",
+                            strval(stats, "frameGenerationBackend"),
+                            stats["frameGenerationSourceFps"].as_f64().unwrap_or(0.),
+                            stats["outputFps"].as_f64().unwrap_or(0.)
                         ),
                     );
                 } else if !strval(stats, "frameGenerationReason").is_empty() {
@@ -1640,6 +1642,11 @@ impl Panels {
                         ui,
                         "等待补帧引擎处理新画面；60 fps 源输入通常需要至少 120 Hz 显示器。",
                     );
+                }
+                if s["status"]["renderFeedback"]["frameGeneration"]["canRetry"] == true
+                    && btn(ui, "重试补帧引擎（重新连接）", can_play(s) && !self.draft.contains_key("frameGeneration") && !self.draft.contains_key("frameGenerationBackend"))
+                {
+                    cmd(out, "retry-frame-generation", json!({}));
                 }
             }
             self.setting_choice(
@@ -2015,6 +2022,16 @@ mod tests {
     fn upscaler_feedback_uses_live_engine_report_and_names_fallbacks() {
         let streaming = json!({"phase":"streaming"});
         let frame = json!({"width":1920,"height":1080,"activeUpscaler":"fsr1"});
+        let hdr = json!({"phase":"streaming","renderFeedback":{"upscaler":{
+            "requested":"rtx-vsr","state":"suspended","reason":"当前超分仅处理 SDR 输入"}}});
+        let message = upscaler_frame_state(&hdr, &frame, "rtx-vsr").unwrap();
+        assert!(message.contains("SDR 输入") && !message.contains("无需放大"));
+        let failed = json!({"phase":"streaming","renderFeedback":{"upscaler":{
+            "requested":"rtx-vsr","state":"error","reason":"初始化失败"}}});
+        assert_eq!(
+            upscaler_frame_state(&failed, &frame, "rtx-vsr"),
+            Some("所选超分处理失败：初始化失败".into())
+        );
         assert_eq!(
             upscaler_frame_state(&streaming, &frame, "rtx-vsr"),
             Some("已选择 NVIDIA RTX 视频超分，当前实际使用：AMD FSR 1".into())

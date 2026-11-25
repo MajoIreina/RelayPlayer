@@ -3,6 +3,21 @@
 #include <algorithm>
 #include <cmath>
 
+// Reason codes cross the render/UI threads as one atomic snapshot.
+// A skipped HDR source is a compatibility limitation, not a no-scaling result.
+inline int relayUpscalerStatus(bool enabled, bool active, bool has_source, bool scaling,
+                              bool vsr, bool hdr, bool failed, bool superseded)
+{
+    if (!enabled) return 0;
+    if (active) return 1;
+    if (!has_source) return 2;
+    if (superseded) return 7;
+    if (!scaling) return 3;
+    if (vsr && hdr) return 4;
+    if (failed) return 5;
+    return 6; // Frame processing did not succeed; never claim the algorithm is active.
+}
+
 // The Relay multiplier is per distinct source picture, including a deduplicated source.
 // Cadence detection must never silently turn the user's 2x selection into 4x.
 struct RelayFrameGenPlan {

@@ -273,13 +273,9 @@ impl Relay {
                 self.surface.hide_video();
             }
             if name == "capture"
+                || matches!(name, "retry-upscaler" | "retry-frame-generation")
                 || (name == "settings"
-                    && arg.as_object().is_some_and(|o| {
-                        o.iter().any(|(k, v)| {
-                            playback::session_key(k)
-                                && self.public.as_ref().unwrap().settings[k] != *v
-                        })
-                    }))
+                    && self.public.as_ref().unwrap().settings_need_reconnect(&arg))
             {
                 self.surface.release_video();
             }
@@ -297,6 +293,7 @@ impl Relay {
                     p.connections.request(name, arg)
                 }
                 "settings" => p.save(&arg),
+                "retry-upscaler" | "retry-frame-generation" => p.retry_enhancements(),
                 "stop" => {
                     let result = p.stop();
                     if result.is_ok() {
