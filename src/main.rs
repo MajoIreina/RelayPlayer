@@ -254,6 +254,19 @@ impl Relay {
         self.tab = if self.tab == Some(t) { None } else { Some(t) };
         self.last_top = Instant::now();
     }
+    fn connect_recent(&mut self) {
+        let recent = self
+            .public
+            .as_ref()
+            .and_then(|p| p.connections.recent_target());
+        self.source_intent = Tab::Connect;
+        if let Some(target) = recent {
+            self.request("connect", target);
+            self.tab = None;
+        } else {
+            self.tab = Some(Tab::Connect);
+        }
+    }
     fn request(&mut self, name: &str, arg: Value) -> Option<u64> {
         if self.public.is_some() {
             if name == "stop" {
@@ -757,18 +770,7 @@ impl Relay {
             if is_active {
                 self.request("stop", json!({}));
             } else {
-                let recent = self
-                    .public
-                    .as_ref()
-                    .and_then(|p| p.connections.recent_target());
-                if let Some(target) = recent {
-                    self.source_intent = Tab::Connect;
-                    self.request("connect", target);
-                    self.tab = None;
-                } else {
-                    self.source_intent = Tab::Connect;
-                    self.tab = Some(Tab::Connect);
-                }
+                self.connect_recent();
             }
         }
         let status = &self.state["status"];
@@ -1223,13 +1225,13 @@ impl Relay {
                     elem(c.x - 131., y, 128., 36.),
                     Icon::Monitor,
                     "连接主机",
-                    "连接主机",
+                    "连接最近使用的主机",
                     ButtonStyle::Primary,
                     true,
                 )
                 .clicked()
                 {
-                    self.selected(Tab::Connect);
+                    self.connect_recent();
                 }
                 if command(
                     ui,
